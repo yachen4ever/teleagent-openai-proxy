@@ -14,6 +14,39 @@ AIGC:
 本项目的所有重要变更记录在此文件中。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [1.10.0] - 2026-10-19
+
+yachen4ever fork 首个版本：基于上游 1.9.10，默认会话行为改为 OpenAI 无状态语义，配置可持久化，并修复一批经三路独立代码审查确认的缺陷。
+
+### 变更
+
+- **默认会话行为改为"每次新建"（session_mode=new）**：未显式传 `session_title` 的请求每次新建会话、由 super-agent 自动命名，恢复 OpenAI 无状态语义（上游行为是所有无标题请求跨天共用 `外部|星小辰-子智能体` 一个会话，且与自带文档矛盾）。显式传 `session_title` 与"机器人预热"心跳不受影响，始终按标题复用
+- **新增配置持久化**：`config.json` 保存 `default_model` / `session_mode`，重启不丢；新增 `GET/POST /api/config`；`POST /api/default-model` 现在会校验模型确已在 TeleAgent 中配置成功（source=config）后才保存
+- **Web 控制台系统页新增"会话模式"配置项**，默认模型说明同步更新
+- **同一会话上的补全请求串行执行**：每个请求独立订阅 `/global/event` 且仅按 sessionID 过滤，并发写同一会话会导致每个客户端收到两份回答的混合内容；现以会话级锁串行化（最长等待 120s，超时返回 503）
+- **HTTP/1.1 keep-alive**：设置 `protocol_version="HTTP/1.1"`，客户端可复用连接，lsof 调用方反查缓存真正生效；SSE 响应头改发 `Connection: close`（与实际关闭行为一致）
+- **UA 短路补全**：UA 已标识调用方类型（python-requests/python-urllib/curl/node/axios）时直接返回，不再每请求无条件执行 lsof+ps 子进程；lsof 端口不再硬编码 8088
+
+### 修复
+
+- **高危：`model` 不带 `/` 时被静默替换成默认模型的 model id**（如请求 `chat-pro` 实际按默认 provider/model 执行且无提示）——现挂到默认 provider 下按请求的 model id 执行；`/api/test` 同型错误一并修复
+- **高危：SSE 逐 chunk 独立 decode UTF-8，TCP 分包切断多字节字符产生 U+FFFD 乱码**（流式与非流式共用此路径，长中文回复必现概率）——改为增量解码器；常驻确认监听器同修
+- **客户端中途断开的连锁问题**：`wfile.write` 无异常保护 + `listen()` 无 try/finally → BrokenPipe 双重未捕获异常、上游 socket 等 GC、磁盘日志永久 `pending`、错误统计丢失——写回全面加保护、监听线程 `stop()` 机制、日志兜底收尾（`client_disconnected`）
+- **`send_error`/`send_complete` 无状态锁存**：上游报错后 `session.status idle` 仍触发 complete → 双 `[DONE]`、统计双计、日志 error 被覆盖为 success——加终态锁存
+- **SSE 握手不校验状态行**：签名失效 401/服务 5xx 被当空事件流静默挂到超时，而 prompt 经 401 重试实际已执行——现在非 200 立即返回明确错误
+- **非流式兜底可能返回上一轮旧回答**：超时/丢事件时 `get_messages` 兜底取"最近一条 assistant 消息"，复用会话场景会把旧答案当本轮响应——现只接受时间晚于本次请求开始的消息（缺时间字段视为不可信）
+- **权限/问题确认场景非流式请求阻塞 600s**：现检测到 confirmation 后 2 秒收尾即返回（原实现普通 SDK 早已超时断开、永远拿不到 confirmation）
+- **请求日志落盘从"每次全量重写当日文件"改为纯追加**：消除 O(n²) 磁盘 I/O 与先 truncate 后写的中途丢日志风险；读取侧按 id 去重取最后一条
+- **非流式 tool_calls 成功分支漏记统计与日志**（永远 pending、不计数）、流式 tool_calls 路径漏记 token
+- **多模态 http(s) 图片 URL 静默丢弃**：现尝试下载到本地交 `image_understanding` 查看，失败时在 prompt 中显式标注；`/tmp/reachy_vision` 历史图片按 24h 自动清理（原实现只写不删）
+- **带 tool_calls 的 assistant 消息 content=null 被转成字符串 "None"**：现提取工具名列表注入上下文；tool 消息保留 `tool_call_id` 关联
+- **`_session_match_key` 误剥自定义标题的尾部 HH:MM**（「每日汇报|09:00」与「每日汇报|18:00」误判同会话）——仅当时间前是代理自建日期段（YYYY-MM-DD）时才剥除
+- **`model: null` / `id` 非字符串等类型错误直接冲出 handler 无响应断连**——入口类型校验，返回 400
+- **`get_session_key` 持锁执行 pgrep/ps**：TeleAgent 重启期间所有请求线程在锁上排队假死——子进程移到锁外，锁只保护缓存读写
+- **`get_stats()` 浅拷贝 `model_usage` 并发迭代竞态**、`/api/logs?limit=abc` 未捕获异常、`[TOOL_CALL]` 标记内 JSON 解析失败吞文本、`/api/test` 每次新建 console-test 会话刷列表（改按天复用）、控制台日志表 `l.status` 未转义
+- **请求体读取加 32MB 上限与 120s 空闲超时**（慢速连接不再无限占线程）；错误 `type` 命名对齐 OpenAI 规范（`invalid_request_error`/`api_error`）
+- **openai_proxy_manager.py**：`SCRIPT_PATH` 不再写死原作者桌面路径，改为跟随脚本所在目录
+
 ## [1.9.10] - 2026-09-27
 
 ### 修复

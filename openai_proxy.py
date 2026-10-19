@@ -18,6 +18,7 @@ TeleAgent OpenAI-Compatible Proxy Server
 
 import argparse
 import base64
+import codecs
 import hashlib
 import hmac
 import json
@@ -43,6 +44,8 @@ SUPER_AGENT_HOST = "127.0.0.1"
 SUPER_AGENT_PORT = 4397
 SUPER_AGENT_BASE = f"http://{SUPER_AGENT_HOST}:{SUPER_AGENT_PORT}"
 SIGN_VERSION = "local-v1"
+# 代理自身监听端口（main() 按启动参数覆盖；lsof 反查调用方时使用）
+_PROXY_PORT = 8088
 DEFAULT_DIRECTORY = os.path.expanduser("~/.local/share/TeleAgent/TeleAgent的工作空间")
 DEFAULT_PROVIDER = "NewApi"
 DEFAULT_MODEL = "chat-pro"
@@ -51,6 +54,74 @@ DEFAULT_MODEL = "chat-pro"
 _dynamic_default_provider = DEFAULT_PROVIDER
 _dynamic_default_model = DEFAULT_MODEL
 
+# ============================================================
+# 配置持久化（fork 新增）
+# config.json 保存 default_model / session_mode，重启不丢
+# ============================================================
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+# 会话模式：
+#   new   - 未显式传 session_title 时每次请求新建会话（OpenAI 无状态语义，fork 默认）
+#   reuse - 未显式传 session_title 时按来源标签复用会话（v1.9.10 及以前的行为）
+# 显式传入 session_title 时两种模式都按标题复用
+SESSION_MODE_NEW = "new"
+SESSION_MODE_REUSE = "reuse"
+_SESSION_MODES = (SESSION_MODE_NEW, SESSION_MODE_REUSE)
+
+_dynamic_session_mode = SESSION_MODE_NEW
+
+
+def get_session_mode():
+    """获取当前会话模式"""
+    with _default_model_lock:
+        return _dynamic_session_mode
+
+
+def set_session_mode(mode):
+    """设置会话模式（不持久化，持久化由调用方 save_config 完成）"""
+    global _dynamic_session_mode
+    if mode not in _SESSION_MODES:
+        return False
+    with _default_model_lock:
+        _dynamic_session_mode = mode
+    return True
+
+
+def load_config():
+    """启动时从 config.json 恢复配置"""
+    global _dynamic_default_provider, _dynamic_default_model, _dynamic_session_mode
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return
+    model = data.get("default_model")
+    if isinstance(model, str) and "/" in model:
+        provider_id, model_id = model.split("/", 1)
+        with _default_model_lock:
+            _dynamic_default_provider = provider_id
+            _dynamic_default_model = model_id
+    mode = data.get("session_mode")
+    if mode in _SESSION_MODES:
+        with _default_model_lock:
+            _dynamic_session_mode = mode
+    print(f"[CONFIG] 已加载配置: default_model={get_default_model()} session_mode={get_session_mode()}")
+
+
+def save_config():
+    """将当前配置写入 config.json"""
+    try:
+        with _default_model_lock:
+            data = {
+                "default_model": f"{_dynamic_default_provider}/{_dynamic_default_model}",
+                "session_mode": _dynamic_session_mode,
+            }
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[CONFIG] 配置保存失败: {e}", file=sys.stderr)
+
+
 # 动态默认模型管理函数
 def get_default_model():
     """获取当前默认模型"""
@@ -58,7 +129,7 @@ def get_default_model():
         return f"{_dynamic_default_provider}/{_dynamic_default_model}"
 
 def set_default_model(provider_id, model_id):
-    """设置默认模型"""
+    """设置默认模型（不持久化，持久化由调用方 save_config 完成）"""
     global _dynamic_default_provider, _dynamic_default_model
     with _default_model_lock:
         _dynamic_default_provider = provider_id
@@ -110,25 +181,17 @@ def _log_file_path(ts=None):
 
 
 def log_request_to_disk(entry):
-    """将一条请求日志以 JSON Lines 追加写盘。
+    """将一条请求日志以 JSON Lines 追加写盘（fork 改为纯追加）。
 
-    同一条请求（按 id 去重）会有两次写入：请求开始时 status=pending，
-    结束时 status=success/error。为避免重复，落盘采用"同 id 覆盖"：
-    每次追加前先扫描当日文件，若已有同 id 记录则就地替换。
+    同一条请求（按 id）会有两次写入：请求开始时 status=pending，
+    结束时写入最终状态。读取侧（read_disk_logs）按 id 去重取最后一条。
+    纯追加避免旧版"每次全量重写当日文件"的 O(n²) I/O 与中途截断丢日志问题。
     """
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
         path = _log_file_path()
-        req_id = entry.get("id", "")
         with _disk_log_lock:
-            # 读当日已有记录，去掉同 id 的旧记录
-            lines = []
-            if os.path.exists(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
-            kept = [ln for ln in lines if (req_id and f'"id": "{req_id}"' not in ln)]
-            with open(path, "w", encoding="utf-8") as f:
-                f.writelines(kept)
+            with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
     except Exception as e:
         print(f"[LOG-DISK] 落盘失败: {e}", file=sys.stderr)
@@ -338,13 +401,27 @@ def identify_caller_process(client_ip, client_port, user_agent=""):
             ua_short_circuit = ua_name
             break
 
+    # ---- UA 短路（fork 修正）：UA 已明确标识调用方类型时直接返回 ----
+    # 原实现只在 lsof 失败或万达云穿透时才用 UA，lsof/ps 仍每请求执行
+    if ua_short_circuit:
+        with _caller_name_lock:
+            _caller_name_cache[cache_key] = {"name": ua_short_circuit, "pid": 0, "cmd": "", "time": now}
+        return ua_short_circuit, 0, ""
+
+    # 缓存防膨胀：超限时清理过期条目
+    with _caller_name_lock:
+        if len(_caller_name_cache) > 512:
+            cutoff = now - _CALLER_CACHE_TTL
+            for k in [k for k, v in _caller_name_cache.items() if v.get("time", 0) < cutoff]:
+                _caller_name_cache.pop(k, None)
+
     # 默认值
     name, pid, cmd = "未知", 0, ""
 
     try:
-        # lsof -i :8088 查出所有连接到 8088 的进程（含客户端和服务端行）
+        # lsof -i :<port> 查出所有连接到代理端口的进程（含客户端和服务端行）
         result = subprocess.run(
-            ["lsof", "-i", f":{8088}", "-n", "-P"],
+            ["lsof", "-i", f":{_PROXY_PORT}", "-n", "-P"],
             capture_output=True, text=True, timeout=3, errors="replace"
         )
         if result.returncode == 0 and result.stdout:
@@ -376,7 +453,7 @@ def identify_caller_process(client_ip, client_port, user_agent=""):
                         left, right = name_field.split("->", 1)
                         # right 格式: 127.0.0.1:8088 (ESTABLISHED)
                         right_port = right.split(":")[-1].split()[0] if ":" in right else ""
-                        if right_port == "8088":
+                        if right_port == str(_PROXY_PORT):
                             # 这是客户端进程
                             pid = proc_pid
                             cmd = proc_cmd
@@ -547,23 +624,33 @@ def get_recent_logs(limit=50):
 
 
 def read_disk_logs(date=None, limit=5000):
-    """从磁盘 JSONL 读取请求日志（重启不丢）。date 为 YYYY-MM-DD，默认当天。"""
+    """从磁盘 JSONL 读取请求日志（重启不丢）。date 为 YYYY-MM-DD，默认当天。
+
+    纯追加写入下同 id 会有 pending + 最终两条记录，此处按 id 去重、取最后一条。
+    """
     try:
         path = _log_file_path()
         if date:
             path = os.path.join(LOG_DIR, f"requests-{date}.jsonl")
         if not os.path.exists(path):
             return []
-        entries = []
+        by_id = {}
+        non_id = []
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 try:
-                    entries.append(json.loads(line))
+                    entry = json.loads(line)
                 except Exception:
                     continue
+                rid = entry.get("id")
+                if rid:
+                    by_id[rid] = entry
+                else:
+                    non_id.append(entry)
+        entries = list(by_id.values()) + non_id
         # 按时间倒序，取最新 limit 条
         entries.sort(key=lambda e: e.get("timestamp", 0), reverse=True)
         return entries[:limit]
@@ -590,9 +677,11 @@ def update_stats(model=None, streaming=False, error=False, tokens=None):
 
 
 def get_stats():
-    """获取统计数据快照"""
+    """获取统计数据快照（深拷贝，避免调用方迭代 model_usage 期间并发写入）"""
     with _stats_lock:
-        return dict(_stats)
+        snapshot = dict(_stats)
+        snapshot["model_usage"] = dict(_stats["model_usage"])
+        return snapshot
 
 
 def _format_uptime(seconds):
@@ -624,48 +713,55 @@ def _format_ts_iso(ts):
 
 
 def get_session_key():
-    """从运行中的 scheduler 进程获取 SUPER_AGENT_LOCAL_SESSION_KEY"""
+    """从运行中的 scheduler 进程获取 SUPER_AGENT_LOCAL_SESSION_KEY
+
+    缓存命中走快路径；未命中时在锁外执行 pgrep/ps 子进程，
+    仅结果写回时持锁，避免 TeleAgent 重启期间所有请求线程在锁上排队。
+    """
     global _cached_session_key, _cached_session_key_time
 
     with _session_key_lock:
-        # 缓存 60 秒
+        # 缓存 60 秒（快路径）
         if _cached_session_key and time.time() - _cached_session_key_time < 60:
             return _cached_session_key
 
-        # 尝试从环境变量获取
-        key = os.environ.get("SUPER_AGENT_LOCAL_SESSION_KEY")
-        if key:
+    # 尝试从环境变量获取
+    key = os.environ.get("SUPER_AGENT_LOCAL_SESSION_KEY")
+    if key:
+        with _session_key_lock:
             _cached_session_key = key
             _cached_session_key_time = time.time()
-            return key
+        return key
 
-        # 从 scheduler/im-service 进程获取
-        try:
-            # 用 pgrep 找到进程 PID
-            result = subprocess.run(
-                ["pgrep", "-f", "scheduler/index.cjs"],
-                capture_output=True, text=True, timeout=5
-            )
-            pids = result.stdout.strip().split("\n")
-            for pid in pids:
-                pid = pid.strip()
-                if not pid:
-                    continue
-                try:
-                    result2 = subprocess.run(
-                        ["ps", "eww", pid], capture_output=True, text=True, timeout=5
-                    )
-                    match = re.search(r"SUPER_AGENT_LOCAL_SESSION_KEY=(\S+)", result2.stdout)
-                    if match:
-                        key = match.group(1)
+    # 从 scheduler/im-service 进程获取（锁外执行子进程）
+    try:
+        # 用 pgrep 找到进程 PID
+        result = subprocess.run(
+            ["pgrep", "-f", "scheduler/index.cjs"],
+            capture_output=True, text=True, timeout=5
+        )
+        pids = result.stdout.strip().split("\n")
+        for pid in pids:
+            pid = pid.strip()
+            if not pid:
+                continue
+            try:
+                result2 = subprocess.run(
+                    ["ps", "eww", pid], capture_output=True, text=True, timeout=5
+                )
+                match = re.search(r"SUPER_AGENT_LOCAL_SESSION_KEY=(\S+)", result2.stdout)
+                if match:
+                    key = match.group(1)
+                    with _session_key_lock:
                         _cached_session_key = key
                         _cached_session_key_time = time.time()
-                        return key
-                except:
-                    pass
-        except Exception as e:
-            print(f"[WARN] 获取 session key 失败: {e}", file=sys.stderr)
+                    return key
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[WARN] 获取 session key 失败: {e}", file=sys.stderr)
 
+    with _session_key_lock:
         return _cached_session_key  # 返回可能过期的缓存
 
 
@@ -747,7 +843,9 @@ def _parse_tool_calls_from_text(text):
                 }
             })
         except (json.JSONDecodeError, KeyError):
-            pass
+            # fork 修复：标记内 JSON 解析失败时保留原文，
+            # 不再既不产出 tool_calls 又把该段文本吞掉
+            clean_parts.append(m.group(0))
     clean_parts.append(text[last_end:])
     clean_text = "".join(clean_parts).strip()
     return clean_text, tool_calls
@@ -812,6 +910,30 @@ def create_session(directory=DEFAULT_DIRECTORY, title=None):
     return None
 
 
+def _validate_model(provider_id, model_id):
+    """校验 provider/model 是否为 TeleAgent 中已配置成功的模型（source=config）
+
+    返回 (ok, detail)。super-agent 不可达时返回失败（fail-closed），
+    避免把无效模型写进持久化配置导致所有默认请求报错。
+    """
+    status, resp, _ = sa_request("GET", "/provider", timeout=10)
+    if status != 200:
+        return False, f"无法连接 super-agent 校验模型 (status={status})"
+    try:
+        data = json.loads(resp)
+    except Exception as e:
+        return False, f"校验模型失败: {e}"
+    for p in data.get("all", []):
+        if p.get("id") != provider_id:
+            continue
+        if p.get("source") != "config":
+            return False, f"provider [{provider_id}] 未在 TeleAgent 中配置 API 密钥"
+        if model_id not in (p.get("models") or {}):
+            return False, f"provider [{provider_id}] 下不存在模型 [{model_id}]"
+        return True, ""
+    return False, f"未知 provider: {provider_id}"
+
+
 # ============================================================
 # 会话按标题复用（企微/QQ机器人：同一用户/同一群复用同一会话）
 # ============================================================
@@ -825,6 +947,8 @@ _SESSION_QUERY_LIMIT = 300   # 查询会话列表上限
 
 # 尾部时间段匹配（HH:MM），用于匹配 key 时丢弃时间、保留日期
 _TIME_SEG_RE = re.compile(r"^\d{1,2}:\d{2}$")
+# 日期段匹配（YYYY-MM-DD）：只有「来源|...|日期|时间」这种代理自建标题才允许剥时间
+_DATE_SEG_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def _session_match_key(title):
@@ -834,11 +958,15 @@ def _session_match_key(title):
       同一天内时间变化 key 不变（继续复用）；跨天日期变化 key 变化（自动新建会话）
     - 「企微|私聊|userid」无时间段 → 完整保留，避免不同用户/群误复用同一会话
     - 不含"|"的标题原样返回（等价精确匹配）
+    - 仅当尾部时间段前是代理自建的日期段（YYYY-MM-DD）时才剥除，
+      避免用户自定义标题（如「每日汇报|09:00」）被误剥导致不同时间互相复用
     """
     if not title:
         return title
     parts = title.split("|")
-    while len(parts) > 1 and _TIME_SEG_RE.match(parts[-1].strip()):
+    while (len(parts) > 2
+           and _TIME_SEG_RE.match(parts[-1].strip())
+           and _DATE_SEG_RE.match(parts[-2].strip())):
         parts.pop()
     return "|".join(parts)
 
@@ -931,6 +1059,44 @@ def get_or_create_session(directory=DEFAULT_DIRECTORY, title=None):
         return sid, False
 
 
+# 会话级互斥：同一会话上的补全请求串行执行。
+# 每个请求都独立订阅 /global/event 并按 sessionID 过滤，并发写同一会话时
+# 两个监听器会同时收到全部文本增量，导致每个客户端收到两份回答的混合内容。
+_session_prompt_locks = {}
+_session_prompt_locks_lock = threading.Lock()
+
+
+def _acquire_session_lock(session_id):
+    """取得会话级锁（不阻塞；调用方自行 acquire/release）"""
+    with _session_prompt_locks_lock:
+        lock = _session_prompt_locks.get(session_id)
+        if lock is None:
+            lock = threading.Lock()
+            # 简单防膨胀：锁条目超限时清掉全部（锁重建只影响串行化粒度，不影响正确性）
+            if len(_session_prompt_locks) > 500:
+                _session_prompt_locks.clear()
+            _session_prompt_locks[session_id] = lock
+    return lock
+
+
+def _cleanup_vision_tmp(max_age=86400):
+    """清理 /tmp/reachy_vision 下超过 max_age 秒的历史图片（fork 新增，原实现只写不删）"""
+    try:
+        d = "/tmp/reachy_vision"
+        if not os.path.isdir(d):
+            return
+        cutoff = time.time() - max_age
+        for name in os.listdir(d):
+            p = os.path.join(d, name)
+            try:
+                if os.path.isfile(p) and os.path.getmtime(p) < cutoff:
+                    os.remove(p)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def send_prompt_async(session_id, messages, directory=DEFAULT_DIRECTORY,
                       provider_id=DEFAULT_PROVIDER, model_id=DEFAULT_MODEL,
                       tools=None, session_reused=False):
@@ -944,6 +1110,7 @@ def send_prompt_async(session_id, messages, directory=DEFAULT_DIRECTORY,
     # TeleAgent 会话本身维护上下文历史，所以：
     #   - 新会话：发送完整历史（建立上下文）
     #   - 复用会话：只发 system+tools + 最新一条消息（避免双重累积）
+    _cleanup_vision_tmp()
 
     # 提取 system 消息
     system_content = None
@@ -959,7 +1126,7 @@ def send_prompt_async(session_id, messages, directory=DEFAULT_DIRECTORY,
                 if isinstance(part, dict) and part.get("type") == "text":
                     text_parts.append(part.get("text", ""))
                 elif isinstance(part, dict) and part.get("type") == "image_url":
-                    # 多模态图片：提取 base64 → 存临时文件 → 在 prompt 中插入文件路径
+                    # 多模态图片：base64 或 http(s) URL → 存临时文件 → 在 prompt 中插入文件路径
                     img_url = part.get("image_url", {}).get("url", "") if isinstance(part.get("image_url"), dict) else part.get("image_url", "")
                     if img_url.startswith("data:image"):
                         # 解析 data URI: data:image/jpeg;base64,xxxx
@@ -975,9 +1142,32 @@ def send_prompt_async(session_id, messages, directory=DEFAULT_DIRECTORY,
                         except Exception as e:
                             print(f"[proxy] Failed to save multimodal image: {e}", flush=True)
                             text_parts.append("[图片解析失败]")
+                    elif img_url.startswith(("http://", "https://")):
+                        # fork：尝试下载 http(s) 图片到本地（原实现静默丢弃）
+                        try:
+                            dl_req = urllib.request.Request(
+                                img_url, headers={"User-Agent": "Mozilla/5.0"}, method="GET"
+                            )
+                            with urllib.request.urlopen(dl_req, timeout=15) as img_resp:
+                                img_bytes = img_resp.read()
+                                m_ct = re.search(r"image/([\w+-]+)", (img_resp.headers.get("Content-Type") or ""))
+                                suffix = f".{m_ct.group(1)}" if m_ct else ".jpg"
+                            img_path = os.path.join("/tmp/reachy_vision", f"proxy_{int(time.time()*1000)}{suffix}")
+                            os.makedirs(os.path.dirname(img_path), exist_ok=True)
+                            with open(img_path, "wb") as f:
+                                f.write(img_bytes)
+                            text_parts.append(f"请用 image_understanding 工具查看图片 {img_path} 并回答问题。")
+                            print(f"[proxy] Multimodal image downloaded to {img_path} ({len(img_bytes)} bytes)", flush=True)
+                        except Exception as e:
+                            print(f"[proxy] 图片下载失败 {img_url[:80]}: {e}", flush=True)
+                            text_parts.append(f"[图片下载失败: {img_url[:120]}]")
+                    else:
+                        text_parts.append("[不支持的图片格式，仅支持 data URI 或 http(s) URL]")
             content = "\n".join(text_parts)
         elif not isinstance(content, str):
-            content = str(content)
+            # content 为 null（如带 tool_calls 的 assistant 消息）时置空，
+            # 避免变成字符串 "None" 污染上下文
+            content = "" if content is None else str(content)
 
         if role == "system":
             if system_content:
@@ -987,10 +1177,22 @@ def send_prompt_async(session_id, messages, directory=DEFAULT_DIRECTORY,
         elif role == "user":
             user_messages.append(content)
         elif role == "assistant":
-            user_messages.append(f"[assistant] {content}")
+            if content:
+                user_messages.append(f"[assistant] {content}")
+            else:
+                # assistant 带 tool_calls 时 content 通常为空：保留工具名信息，
+                # 不再退化成 "[assistant] None"
+                tc_names = []
+                for tc in (msg.get("tool_calls") or []):
+                    fn = tc.get("function") or {} if isinstance(tc, dict) else {}
+                    tc_names.append(fn.get("name") or (tc.get("id", "?") if isinstance(tc, dict) else "?"))
+                if tc_names:
+                    user_messages.append(f"[assistant] (此前调用了工具: {', '.join(tc_names)})")
         elif role == "tool":
-            # 工具返回结果，作为对话上下文注入
-            user_messages.append(f"[tool_result] {content}")
+            # 工具返回结果，作为对话上下文注入（保留 tool_call_id 关联）
+            tc_id = msg.get("tool_call_id") or ""
+            prefix = f"[tool_result:{tc_id}] " if tc_id else "[tool_result] "
+            user_messages.append(f"{prefix}{content}")
 
     # 如果有工具定义，注入到 system 消息
     if tools:
@@ -1181,12 +1383,27 @@ def reply_question(question_id, answers):
     return False, f"HTTP {status}: {resp[:200]}"
 
 
-def extract_assistant_text(messages):
-    """从消息列表中提取最终的助手回复文本"""
+def extract_assistant_text(messages, min_time=None):
+    """从消息列表中提取最终的助手回复文本
+
+    min_time: epoch 秒。仅接受时间晚于该值的 assistant 消息——
+    复用会话场景下兜底 get_messages 时，防止把上一轮的旧回答
+    当作本轮响应返回（fork 修复）。消息缺时间字段且 min_time
+    非空时视为不可信，跳过（宁可明确报错也不返回错误答案）。
+    """
     for msg in reversed(messages):
         info = msg.get("info", msg)
         role = info.get("role", "")
         if role == "assistant":
+            if min_time is not None:
+                t = info.get("time")
+                if isinstance(t, dict):
+                    t = t.get("created")
+                if not isinstance(t, (int, float)) or t <= 0:
+                    continue
+                t_sec = t / 1000.0 if t > 10**12 else float(t)
+                if t_sec < min_time - 5:
+                    continue
             # 检查是否有错误
             if info.get("error"):
                 return None, info["error"]
@@ -1215,6 +1432,7 @@ class SSEListener:
         self.buffer = ""
         self.header_parsed = False
         self.completed = False
+        self.client_gone = False   # 客户端连接已断开（写回失败后置位并停止监听）
         self.text_chunks = []  # 收到的文本增量
         self.reasoning_chunks = []  # 推理过程增量
         self.error = None
@@ -1227,6 +1445,22 @@ class SSEListener:
         # 待确认请求（permission.asked / question.asked 事件）
         self.on_confirmation = None   # 回调：conf_id, conf_type, description, tool
         self.pending_confirmations = []  # 本监听器收集到的待确认请求
+
+    def stop(self):
+        """主动停止监听：关闭上游 socket，让 select/recv 立即返回"""
+        self.client_gone = True
+        try:
+            if self.sock:
+                self.sock.close()
+        except Exception:
+            pass
+
+    def _safe_callback(self, fn, *args):
+        """安全调用回调：客户端断开（写回失败）时停止监听，避免异常杀死监听线程"""
+        try:
+            fn(*args)
+        except Exception:
+            self.stop()
 
     def _make_request(self, path):
         headers = sign_request("GET", path)
@@ -1243,66 +1477,86 @@ class SSEListener:
         """监听 SSE 事件，直到收到完成或超时"""
         path = "/global/event"
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.settimeout(5)
-        self.sock.connect((SUPER_AGENT_HOST, SUPER_AGENT_PORT))
-        self.sock.sendall(self._make_request(path))
-
-        start = time.time()
-        current_text_part_id = None
-
-        while time.time() - start < self.timeout:
-            ready = select.select([self.sock], [], [], 1)
-            if ready[0]:
-                try:
-                    chunk = self.sock.recv(8192)
-                except:
-                    break
-                if not chunk:
-                    break
-                self.buffer += chunk.decode("utf-8", errors="replace")
-
-                # 解析 HTTP 头
-                if not self.header_parsed and "\r\n\r\n" in self.buffer:
-                    _, self.buffer = self.buffer.split("\r\n\r\n", 1)
-                    self.header_parsed = True
-
-                if self.header_parsed:
-                    # 处理 chunked encoding + SSE
-                    # SSE 事件以 data: 行开头
-                    lines = self.buffer.split("\n")
-                    self.buffer = lines.pop()  # 保留最后一行（可能不完整）
-
-                    for line in lines:
-                        line = line.strip()
-                        if not line.startswith("data:"):
-                            continue
-                        event_data = line[5:].strip()
-                        if not event_data:
-                            continue
-                        # 跳过 hex chunk 大小行
-                        try:
-                            int(event_data, 16)
-                            continue
-                        except ValueError:
-                            pass
-
-                        try:
-                            event = json.loads(event_data)
-                        except json.JSONDecodeError:
-                            continue
-
-                        self._handle_event(event)
-
-                        if self.completed:
-                            break
-
-            if self.completed:
-                break
-
         try:
-            self.sock.close()
-        except:
-            pass
+            self.sock.settimeout(5)
+            self.sock.connect((SUPER_AGENT_HOST, SUPER_AGENT_PORT))
+            self.sock.sendall(self._make_request(path))
+
+            start = time.time()
+            status_line = None
+            # 增量 UTF-8 解码：TCP 分包可能切断多字节字符，
+            # 逐块独立 decode 会产生 U+FFFD 乱码，增量解码器会把不完整序列留到下一块
+            decoder = codecs.getincrementaldecoder("utf-8")("replace")
+
+            while time.time() - start < self.timeout:
+                if self.client_gone:
+                    break
+                ready = select.select([self.sock], [], [], 1)
+                if ready[0]:
+                    try:
+                        chunk = self.sock.recv(8192)
+                    except Exception:
+                        break
+                    if not chunk:
+                        break
+                    self.buffer += decoder.decode(chunk)
+
+                    # 校验 HTTP 状态行：非 200（如签名失效 401、服务 5xx）时给出明确
+                    # 错误并立即结束，而不是把错误响应当空事件流静默挂到超时
+                    if status_line is None:
+                        if "\r\n" not in self.buffer:
+                            continue
+                        status_line, self.buffer = self.buffer.split("\r\n", 1)
+                        http_status = (status_line.split(" ") + [""])[1]
+                        if http_status != "200":
+                            self.error = {"message": f"事件流握手失败: {status_line}"}
+                            return
+
+                    # 解析 HTTP 头
+                    if not self.header_parsed and "\r\n\r\n" in self.buffer:
+                        _, self.buffer = self.buffer.split("\r\n\r\n", 1)
+                        self.header_parsed = True
+
+                    if self.header_parsed:
+                        # 处理 chunked encoding + SSE
+                        # SSE 事件以 data: 行开头
+                        lines = self.buffer.split("\n")
+                        self.buffer = lines.pop()  # 保留最后一行（可能不完整）
+
+                        for line in lines:
+                            line = line.strip()
+                            if not line.startswith("data:"):
+                                continue
+                            event_data = line[5:].strip()
+                            if not event_data:
+                                continue
+                            # 跳过 hex chunk 大小行
+                            try:
+                                int(event_data, 16)
+                                continue
+                            except ValueError:
+                                pass
+
+                            try:
+                                event = json.loads(event_data)
+                            except json.JSONDecodeError:
+                                continue
+
+                            self._handle_event(event)
+
+                            if self.completed or self.client_gone:
+                                break
+
+                if self.completed or self.client_gone:
+                    break
+        except Exception as e:
+            if not self.client_gone:
+                self.error = self.error or {"message": f"事件流异常: {e}"}
+        finally:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
 
     def _handle_event(self, event):
         """处理单个 SSE 事件"""
@@ -1402,7 +1656,7 @@ class SSEListener:
                                                        self.session_id, desc, tool)
                 # 仅首次登记时触发回调（避免双通道重复注入 SSE 确认）
                 if is_new and self.on_confirmation:
-                    self.on_confirmation(permission_id, "permission", desc, tool)
+                    self._safe_callback(self.on_confirmation, permission_id, "permission", desc, tool)
 
         elif etype == "question.asked":
             # AI 向用户提问（需要选择答案）
@@ -1423,7 +1677,7 @@ class SSEListener:
                                                        self.session_id, desc, tool)
                 # 仅首次登记时触发回调（避免双通道重复注入 SSE 确认）
                 if is_new and self.on_confirmation:
-                    self.on_confirmation(question_id, "question", desc, tool)
+                    self._safe_callback(self.on_confirmation, question_id, "question", desc, tool)
 
     def get_full_text(self):
         """获取完整的回复文本"""
@@ -1539,6 +1793,8 @@ class GlobalConfirmationListener:
                 sock = self._connect_socket()
                 buffer = ""
                 header_parsed = False
+                # 增量 UTF-8 解码，避免分包切断多字节字符
+                decoder = codecs.getincrementaldecoder("utf-8")("replace")
                 print("[GLOBAL-CONF] 常驻确认监听器已连接 /global/event", file=sys.stderr)
                 while not self._stop.is_set():
                     ready = select.select([sock], [], [], 1)
@@ -1552,7 +1808,7 @@ class GlobalConfirmationListener:
                         break
                     if not chunk:
                         break
-                    buffer += chunk.decode("utf-8", errors="replace")
+                    buffer += decoder.decode(chunk)
                     if not header_parsed and "\r\n\r\n" in buffer:
                         _, buffer = buffer.split("\r\n\r\n", 1)
                         header_parsed = True
@@ -1640,7 +1896,7 @@ class StreamingSSEListener(SSEListener):
                 self._user_msg_ids.add(msg_id)
             if info.get("finish") == "error" or info.get("error"):
                 self.error = info.get("error", {"message": "Unknown error"})
-                self.on_error(self.error)
+                self._safe_callback(self.on_error, self.error)
 
         elif etype == "message.part.updated":
             part = props.get("part", {})
@@ -1656,7 +1912,7 @@ class StreamingSSEListener(SSEListener):
                 # 发送完整文本块（如果还没开始流式输出）
                 if not self._text_started:
                     self.text_chunks.append(text)
-                    self.on_delta(text)
+                    self._safe_callback(self.on_delta, text)
                     self._text_started = True
 
             if part_type == "step-finish":
@@ -1664,7 +1920,7 @@ class StreamingSSEListener(SSEListener):
 
             if part.get("error"):
                 self.error = part.get("error")
-                self.on_error(self.error)
+                self._safe_callback(self.on_error, self.error)
 
         elif etype == "message.part.delta":
             part_id = props.get("partID", "")
@@ -1676,13 +1932,13 @@ class StreamingSSEListener(SSEListener):
                 if part_id in self._assistant_text_part_ids:
                     self._text_started = True
                     self.text_chunks.append(delta)
-                    self.on_delta(delta)
+                    self._safe_callback(self.on_delta, delta)
 
         elif etype == "session.status":
             status = props.get("status", {})
             if status.get("type") == "idle":
                 self.completed = True
-                self.on_complete()
+                self._safe_callback(self.on_complete)
 
         elif etype == "permission.asked":
             # AI 需要用户授权（访问外部目录、执行命令等）
@@ -1717,7 +1973,7 @@ class StreamingSSEListener(SSEListener):
                                                        self.session_id, desc, tool)
                 # 仅首次登记时触发回调（避免双通道重复注入 SSE 确认）
                 if is_new and self.on_confirmation:
-                    self.on_confirmation(permission_id, "permission", desc, tool)
+                    self._safe_callback(self.on_confirmation, permission_id, "permission", desc, tool)
 
         elif etype == "question.asked":
             # AI 向用户提问（需要选择答案）
@@ -1738,42 +1994,82 @@ class StreamingSSEListener(SSEListener):
                                                        self.session_id, desc, tool)
                 # 仅首次登记时触发回调（避免双通道重复注入 SSE 确认）
                 if is_new and self.on_confirmation:
-                    self.on_confirmation(question_id, "question", desc, tool)
+                    self._safe_callback(self.on_confirmation, question_id, "question", desc, tool)
 
 
 # ============================================================
 # OpenAI 兼容 HTTP 服务器
 # ============================================================
 class OpenAIHandler(BaseHTTPRequestHandler):
+    # 启用 HTTP/1.1 keep-alive：客户端可在同一连接上复用请求，
+    # 也让 lsof 调用方反查的 (ip, port) 缓存真正生效
+    protocol_version = "HTTP/1.1"
+    # 读写空闲超时（秒）：防止慢速/半开连接占住工作线程。
+    # 只影响阻塞中的读写；SSE 期间小块写入不会阻塞超时。
+    timeout = 120
+    # 客户端连接已断开标志（写回失败时置位）
+    client_gone = False
+    # 请求体大小上限 32MB
+    MAX_BODY = 32 * 1024 * 1024
+
     def log_message(self, format, *args):
         # 简化日志
         print(f"[{self.log_date_time_string()}] {format % args}", file=sys.stderr)
 
+    def _read_body(self):
+        """读取请求体（带大小上限），异常时直接回错并返回 None"""
+        try:
+            content_length = int(self.headers.get("Content-Length", 0) or 0)
+        except (TypeError, ValueError):
+            self._send_json(400, {"error": {"message": "invalid Content-Length", "type": "invalid_request_error"}})
+            return None
+        if content_length > self.MAX_BODY:
+            self._send_json(413, {"error": {"message": "request body too large", "type": "invalid_request_error"}})
+            return None
+        try:
+            return self.rfile.read(content_length) if content_length > 0 else b""
+        except Exception:
+            self.client_gone = True
+            return None
+
     def _send_json(self, status, data):
         body = json.dumps(data, ensure_ascii=False).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return True
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            self.client_gone = True
+            return False
 
     def _send_sse_headers(self):
         """发送 SSE 流式响应的 HTTP 头"""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
+        # SSE 无 Content-Length，HTTP/1.1 下以关闭连接收尾（流结束即 EOF）
+        self.send_header("Connection", "close")
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
+        self.close_connection = True
 
     def _send_sse_chunk(self, data):
         chunk = f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
-        self.wfile.write(chunk.encode())
-        self.wfile.flush()
+        try:
+            self.wfile.write(chunk.encode())
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            self.client_gone = True
 
     def _send_sse_end(self):
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
+        try:
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            self.client_gone = True
         # SSE 流结束后必须关闭连接，否则客户端 fetch 永远等不到 EOF 而挂起
         self.close_connection = True
 
@@ -1798,12 +2094,14 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             self._handle_api_stats()
         elif path == "/api/default-model":
             self._handle_api_default_model()
+        elif path == "/api/config":
+            self._handle_api_config()
         elif path == "/api/permission/reply":
             self._handle_permission_reply()
         elif path == "/api/permission/pending":
             self._handle_permission_pending()
         else:
-            self._send_json(404, {"error": {"message": "Not found", "type": "invalid_request"}})
+            self._send_json(404, {"error": {"message": "Not found", "type": "invalid_request_error"}})
 
     def do_POST(self):
         path = self.path.split("?")[0]
@@ -1815,12 +2113,14 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             self._handle_api_test()
         elif path == "/api/default-model":
             self._handle_api_default_model()
+        elif path == "/api/config":
+            self._handle_api_config()
         elif path == "/api/permission/reply":
             self._handle_permission_reply()
         elif path == "/api/permission/inject":
             self._handle_permission_inject()
         else:
-            self._send_json(404, {"error": {"message": "Not found", "type": "invalid_request"}})
+            self._send_json(404, {"error": {"message": "Not found", "type": "invalid_request_error"}})
 
     # ======== 管理 API ========
 
@@ -1850,6 +2150,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 "uptime_human": _format_uptime(uptime),
                 "listen": f"0.0.0.0:{self.server.server_address[1]}",
                 "default_model": get_default_model(),
+                "session_mode": get_session_mode(),
                 "default_directory": DEFAULT_DIRECTORY,
             },
             "super_agent": {
@@ -1893,7 +2194,11 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         limit = 100
         from urllib.parse import urlparse, parse_qs
         qs = parse_qs(urlparse(self.path).query)
-        limit = int(qs.get("limit", ["100"])[0])
+        try:
+            limit = int(qs.get("limit", ["100"])[0])
+        except (TypeError, ValueError):
+            limit = 100
+        limit = max(1, min(limit, 1000))
         # 参数 date=YYYY-MM-DD 指定查某天磁盘日志；默认查当天
         date_arg = qs.get("date", [None])[0]
         logs = get_recent_logs(limit)
@@ -1930,41 +2235,102 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             return
         
         # 设置新默认模型
+        body = self._read_body()
+        if body is None:
+            return
         try:
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_length)
             req_data = json.loads(body)
-        except:
+        except Exception:
             self._send_json(400, {"error": "Invalid JSON"})
             return
-        
+
         model = req_data.get("model")
-        if not model:
-            self._send_json(400, {"error": "model is required"})
+        if not isinstance(model, str) or not model.strip():
+            self._send_json(400, {"error": "model is required (string)"})
             return
-        
+
         if "/" in model:
             provider_id, model_id = model.split("/", 1)
         else:
-            # 如果没有指定provider，使用当前默认provider
-            provider_id, model_id = get_default_model_parts()
+            # 未指定 provider 时挂到当前默认 provider 下（不再静默替换模型名）
+            provider_id = get_default_model_parts()[0]
             model_id = model
-        
-        if set_default_model(provider_id, model_id):
+
+        # fork：校验模型确已在 TeleAgent 中配置成功，拒绝无效值
+        ok, detail = _validate_model(provider_id, model_id)
+        if not ok:
+            self._send_json(400, {"error": detail})
+            return
+
+        set_default_model(provider_id, model_id)
+        save_config()
+        self._send_json(200, {
+            "success": True,
+            "default_model": get_default_model(),
+            "message": f"默认模型已更改为 {get_default_model()}（已持久化）"
+        })
+
+    def _handle_api_config(self):
+        """GET/POST /api/config — 读取/修改全局配置（默认模型 + 会话模式，持久化到 config.json）"""
+        if self.command == "GET":
             self._send_json(200, {
-                "success": True,
                 "default_model": get_default_model(),
-                "message": f"默认模型已更改为 {get_default_model()}"
+                "session_mode": get_session_mode(),
+                "session_mode_options": [
+                    {"value": SESSION_MODE_NEW, "label": "每次新建会话（OpenAI 无状态语义，fork 默认）"},
+                    {"value": SESSION_MODE_REUSE, "label": "按来源复用会话（v1.9.10 及以前行为）"},
+                ],
             })
-        else:
-            self._send_json(500, {"error": "Failed to set default model"})
+            return
+
+        body = self._read_body()
+        if body is None:
+            return
+        try:
+            req_data = json.loads(body)
+        except Exception:
+            self._send_json(400, {"error": "Invalid JSON"})
+            return
+
+        model = req_data.get("default_model")
+        if model is not None:
+            if not isinstance(model, str) or "/" not in model:
+                self._send_json(400, {"error": "default_model 必须为 'provider/model' 格式"})
+                return
+            provider_id, model_id = model.split("/", 1)
+            ok, detail = _validate_model(provider_id, model_id)
+            if not ok:
+                self._send_json(400, {"error": detail})
+                return
+
+        mode = req_data.get("session_mode")
+        if mode is not None and mode not in _SESSION_MODES:
+            self._send_json(400, {"error": f"session_mode 必须为 {list(_SESSION_MODES)} 之一"})
+            return
+
+        changed = []
+        if model is not None:
+            set_default_model(provider_id, model_id)
+            changed.append(f"默认模型={get_default_model()}")
+        if mode is not None:
+            set_session_mode(mode)
+            changed.append(f"会话模式={mode}")
+        if changed:
+            save_config()
+        self._send_json(200, {
+            "success": True,
+            "message": ("已保存: " + "；".join(changed)) if changed else "无变更",
+            "default_model": get_default_model(),
+            "session_mode": get_session_mode(),
+        })
 
     def _handle_api_test(self):
+        body = self._read_body()
+        if body is None:
+            return
         try:
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_length)
             req_data = json.loads(body)
-        except:
+        except Exception:
             self._send_json(400, {"error": "Invalid JSON"})
             return
         model = req_data.get("model", get_default_model())
@@ -1972,8 +2338,13 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         if "/" in model:
             provider_id, model_id = model.split("/", 1)
         else:
-            provider_id, model_id = get_default_model_parts()
-        session_id = create_session(directory=DEFAULT_DIRECTORY, title="console-test")
+            provider_id = get_default_model_parts()[0]
+            model_id = model
+        # fork：面板测试会话按天复用，不再每次新建 console-test 会话刷列表
+        date_str, _time_str = _now_date_time()
+        session_id, _reused = get_or_create_session(
+            directory=DEFAULT_DIRECTORY, title=f"面板测试|{date_str}"
+        )
         if not session_id:
             self._send_json(500, {"error": "Failed to create session"})
             return
@@ -2034,7 +2405,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": f"Invalid JSON: {e}"})
             return
 
-        conf_id = req_data.get("id", "").strip()
+        conf_id = req_data.get("id", "")
+        conf_id = conf_id.strip() if isinstance(conf_id, str) else ""
         if not conf_id:
             self._send_json(400, {"error": "id is required (permissionID or questionID)"})
             return
@@ -2146,34 +2518,34 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 pass
 
         if not models:
-            # 返回默认模型
+            # fork：fallback 使用动态默认模型（不再硬编码 chat-flash）
+            fb_provider, fb_model = get_default_model_parts()
             models = [
-                {"id": f"{DEFAULT_PROVIDER}/{DEFAULT_MODEL}", "object": "model",
-                 "created": int(time.time()), "owned_by": DEFAULT_PROVIDER},
-                {"id": f"{DEFAULT_PROVIDER}/chat-flash", "object": "model",
-                 "created": int(time.time()), "owned_by": DEFAULT_PROVIDER},
+                {"id": f"{fb_provider}/{fb_model}", "object": "model",
+                 "created": int(time.time()), "owned_by": fb_provider},
             ]
 
         self._send_json(200, {"object": "list", "data": models})
 
     def _handle_embeddings(self):
         """处理 embedding 请求 - 转发到 Ollama OpenAI 兼容 API"""
+        body = self._read_body()
+        if body is None:
+            return
         try:
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_length)
             req_data = json.loads(body)
         except Exception as e:
-            self._send_json(400, {"error": {"message": f"Invalid JSON: {e}", "type": "invalid_request"}})
+            self._send_json(400, {"error": {"message": f"Invalid JSON: {e}", "type": "invalid_request_error"}})
             return
 
         model = req_data.get("model", "")
         input_text = req_data.get("input", "")
 
         if not model:
-            self._send_json(400, {"error": {"message": "model is required", "type": "invalid_request"}})
+            self._send_json(400, {"error": {"message": "model is required", "type": "invalid_request_error"}})
             return
         if not input_text:
-            self._send_json(400, {"error": {"message": "input is required", "type": "invalid_request"}})
+            self._send_json(400, {"error": {"message": "input is required", "type": "invalid_request_error"}})
             return
 
         # Parse provider/model
@@ -2200,7 +2572,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     return
             except urllib.error.HTTPError as e:
                 error_body = e.read().decode("utf-8", errors="replace")
-                self._send_json(e.code, {"error": {"message": f"Ollama error: {error_body}", "type": "upstream_error"}})
+                self._send_json(e.code, {"error": {"message": f"Ollama error: {error_body}", "type": "api_error"}})
                 return
             except Exception as e:
                 self._send_json(500, {"error": {"message": f"Ollama request failed: {e}", "type": "server_error"}})
@@ -2222,22 +2594,29 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 self._send_json(500, {"error": {"message": f"vLLM embedding failed: {e}", "type": "server_error"}})
                 return
         else:
-            self._send_json(404, {"error": {"message": f"Embedding not supported for provider: {provider_id}", "type": "invalid_request"}})
+            self._send_json(404, {"error": {"message": f"Embedding not supported for provider: {provider_id}", "type": "invalid_request_error"}})
 
     def _handle_chat_completions(self):
         """处理聊天补全请求"""
         # 读取请求体
+        body = self._read_body()
+        if body is None:
+            return
         try:
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_length)
             req_data = json.loads(body)
         except Exception as e:
-            self._send_json(400, {"error": {"message": f"Invalid JSON: {e}", "type": "invalid_request"}})
+            self._send_json(400, {"error": {"message": f"Invalid JSON: {e}", "type": "invalid_request_error"}})
             return
 
         messages = req_data.get("messages", [])
         stream = req_data.get("stream", False)
+        # fork：model 键存在但为 null/非字符串时不再让 TypeError 冲出 handler 断连
         model = req_data.get("model", get_default_model())
+        if model is None or model == "":
+            model = get_default_model()
+        if not isinstance(model, str):
+            self._send_json(400, {"error": {"message": "model must be a string", "type": "invalid_request_error"}})
+            return
         stream_options = req_data.get("stream_options", {}) or {}
         tools = req_data.get("tools", None)  # 提取 tools 参数
         if tools:
@@ -2248,14 +2627,17 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         if "/" in model:
             provider_id, model_id = model.split("/", 1)
         else:
-            provider_id, model_id = get_default_model_parts()
+            # fork 修复：未带 "/" 的模型名挂到当前默认 provider 下执行，
+            # 不再把请求的模型名静默替换成默认模型的 model id
+            provider_id = get_default_model_parts()[0]
+            model_id = model
 
         # 生成请求 ID
         request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
 
         if not messages:
-            self._send_json(400, {"error": {"message": "messages is required", "type": "invalid_request"}})
+            self._send_json(400, {"error": {"message": "messages is required", "type": "invalid_request_error"}})
             return
 
         # ===== 提取 prompt 摘要用于来源判定与日志 =====
@@ -2337,18 +2719,64 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 if not source_detail or source_detail == raw_session_title:
                     source_detail = caller_name
 
-        # ===== 构造带来源前缀的会话标题 =====
-        # 未传标题时来源前缀（脚本/curl/预热/子智能体）直接体现到会话名；
-        # 原始标题已含来源（企微/QQ/密信等）则原样保留。
-        session_title = build_source_session_title(source_tag, caller_name, raw_session_title)
-
-        # 创建会话（带标题时按标题复用，避免机器人一句话开一个会话）
-        session_id, session_reused = get_or_create_session(
-            directory=DEFAULT_DIRECTORY, title=session_title
-        )
+        # ===== 创建/复用会话（fork：默认会话模式可配置） =====
+        # - 显式传 session_title：直接使用调用方的业务标题并按其复用
+        #   （fork 修复：原实现的 build_source_session_title 会把 curl/脚本等
+        #   来源的显式标题整个替换成来源标签标题，业务标题被丢弃）
+        # - 机器人预热：保持按标题复用（高频心跳不能刷会话）
+        # - 未传标题且 session_mode=new（fork 默认）：每次新建会话，
+        #   由 super-agent 自动命名，保持 OpenAI 无状态语义
+        # - 未传标题且 session_mode=reuse：按来源标签复用（v1.9.10 及以前行为）
+        explicit_title = bool(req_data.get("session_title"))
+        if explicit_title:
+            session_title = raw_session_title
+        else:
+            session_title = build_source_session_title(source_tag, caller_name, raw_session_title)
+        session_id = None
+        session_reused = False
+        if (not explicit_title and not is_warmup
+                and get_session_mode() == SESSION_MODE_NEW):
+            session_title = f"(自动命名|{source_tag})"
+            session_id = create_session(directory=DEFAULT_DIRECTORY, title=None)
+        if not session_id:
+            session_id, session_reused = get_or_create_session(
+                directory=DEFAULT_DIRECTORY, title=session_title
+            )
         if not session_id:
             self._send_json(500, {"error": {"message": "Failed to create session", "type": "server_error"}})
             return
+
+        # fork：同一会话上的补全请求串行执行——两个监听器都订阅 /global/event，
+        # 并发写同一会话会导致每个客户端收到两份回答的混合内容
+        session_lock = _acquire_session_lock(session_id)
+        if not session_lock.acquire(timeout=120):
+            self._send_json(503, {"error": {"message": "同一会话上已有请求在处理，请稍后重试",
+                                            "type": "server_error"}})
+            return
+        try:
+            self._dispatch_completion(
+                session_id, messages, stream, provider_id, model_id,
+                session_title=session_title,
+                explicit_title=explicit_title,
+                source_tag=source_tag, source_detail=source_detail,
+                client_ip=client_ip, user_agent=user_agent,
+                caller=(caller_name, caller_pid, caller_cmd),
+                prompt_preview=prompt_preview,
+                session_reused=session_reused,
+                tools=tools, stream_options=stream_options,
+            )
+        finally:
+            session_lock.release()
+
+    def _dispatch_completion(self, session_id, messages, stream, provider_id, model_id,
+                             session_title, explicit_title, source_tag, source_detail,
+                             client_ip, user_agent, caller, prompt_preview,
+                             session_reused, tools, stream_options):
+        """登记日志并分派到流式/非流式处理（持有会话锁调用）"""
+        caller_name, caller_pid, caller_cmd = caller
+        request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        created = int(time.time())
+        model_name = f"{provider_id}/{model_id}"
 
         # 登记 session_id -> session_title 映射（供确认事件关联机器人侧会话）
         with _session_title_map_lock:
@@ -2363,7 +2791,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         log_entry = {
             "id": request_id,
             "timestamp": time.time(),
-            "model": model,
+            "model": model_name,
             "stream": stream,
             "session_id": session_id,
             "session_title": session_title,
@@ -2385,7 +2813,6 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         log_request(log_entry)
         start_time = time.time()
 
-        # 包装回调以记录日志
         if stream:
             self._handle_streaming_logged(session_id, messages, request_id, created,
                                           provider_id, model_id, log_entry, start_time,
@@ -2407,6 +2834,16 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         collected_tokens = None
         has_error = False
         stream_options = stream_options or {}
+        # fork：终态锁存——send_error / send_complete 只允许其一执行，
+        # 避免上游报错后 session idle 又触发 complete，产生双 [DONE] 与统计双计
+        terminal = {"sent": False}
+
+        def _terminal_begin():
+            if terminal["sent"] or self.client_gone:
+                terminal["sent"] = True
+                return False
+            terminal["sent"] = True
+            return True
 
         # Tool call 检测状态
         # 当 tools 参数存在时，始终缓冲完整响应再解析（LLM 可能在 tool call 前加对话文字）
@@ -2436,6 +2873,10 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         def send_delta(text):
             if not text:
                 return
+            # fork：客户端已断开时停止监听线程，不再继续投递
+            if self.client_gone:
+                listener.stop()
+                return
 
             if _has_tools:
                 # 有 tools 时始终缓冲，等完整响应再解析
@@ -2444,9 +2885,13 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
             # 无 tools 时正常流式
             _emit_content(text)
+            if self.client_gone:
+                listener.stop()
 
         def send_complete():
             nonlocal collected_tokens, first_chunk_sent
+            if not _terminal_begin():
+                return
 
             # 有 tools 时：缓冲了完整响应，现在解析
             if _has_tools and _buffer:
@@ -2519,7 +2964,11 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     log_entry["status"] = "success"
                     log_entry["response_preview"] = f"[tool_calls: {len(tool_calls)}]"
                     log_entry["duration_ms"] = int((time.time() - start_time) * 1000)
-                    update_stats(model=model_name, streaming=True)
+                    listener_tokens = getattr(listener, 'tokens', None)
+                    if listener_tokens:
+                        log_entry["tokens"] = listener_tokens
+                    # fork 修复：tool_calls 流式路径补记 token 统计
+                    update_stats(model=model_name, streaming=True, tokens=listener_tokens)
                     log_request_to_disk(log_entry)
                     return
                 else:
@@ -2570,6 +3019,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
         def send_error(err):
             nonlocal has_error
+            if not _terminal_begin():
+                return
             has_error = True
             err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
             error_chunk = {
@@ -2623,8 +3074,20 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             return
 
         sse_thread.join(timeout=600)
-        if not listener.completed and not has_error:
+        listener.stop()
+        if not listener.completed and not has_error and not terminal["sent"]:
             send_error({"message": "Response timeout"})
+        # fork：日志兜底收尾——客户端断开等异常路径下保证不残留 pending、统计不丢失
+        if log_entry.get("status") == "pending":
+            log_entry["status"] = "error" if has_error else "client_disconnected"
+            log_entry["error"] = log_entry.get("error") or ("客户端断开" if not has_error else "上游错误")
+            log_entry["duration_ms"] = int((time.time() - start_time) * 1000)
+            listener_tokens = getattr(listener, 'tokens', None)
+            if listener_tokens:
+                log_entry["tokens"] = listener_tokens
+            update_stats(model=model_name, streaming=True, error=has_error,
+                         tokens=listener_tokens)
+            log_request_to_disk(log_entry)
 
     def _handle_non_streaming_logged(self, session_id, messages, request_id, created,
                                       provider_id, model_id, log_entry, start_time,
@@ -2656,7 +3119,23 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             log_request_to_disk(log_entry)
             return
 
-        sse_thread.join(timeout=600)
+        # fork：等待完成，出现待确认事件时尽早返回（原实现 join 挂满 600s，
+        # 普通 SDK 早已超时断开，永远拿不到 confirmation）
+        deadline = time.time() + 600
+        confirmation_grace = None
+        while True:
+            sse_thread.join(timeout=1)
+            if not sse_thread.is_alive():
+                break
+            if confirmations:
+                # 首个确认出现后再留 2 秒收集已产出的文本，随即返回 confirmation
+                if confirmation_grace is None:
+                    confirmation_grace = time.time() + 2
+                elif time.time() > confirmation_grace:
+                    break
+            if time.time() > deadline:
+                break
+        listener.stop()
         text = listener.get_full_text()
         error = listener.error
         tokens = listener.tokens
@@ -2691,7 +3170,9 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
         if not text:
             msgs = get_messages(session_id)
-            text, msg_error = extract_assistant_text(msgs)
+            # fork：兜底只接受本次请求开始之后产生的 assistant 消息，
+            # 防止复用会话场景下把上一轮旧回答当成本轮响应
+            text, msg_error = extract_assistant_text(msgs, min_time=start_time)
             if msg_error:
                 self._send_json(500, {"error": {"message": str(msg_error), "type": "server_error"}})
                 log_entry["status"] = "error"
@@ -2735,8 +3216,13 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 "usage": usage,
             }
             self._send_json(200, response)
+            # fork 修复：该分支补齐统计与日志收尾（原实现漏记，永远显示 pending）
             log_entry["status"] = "success"
             log_entry["response_preview"] = f"[tool_calls: {len(tool_calls)}]"
+            log_entry["duration_ms"] = int((time.time() - start_time) * 1000)
+            log_entry["tokens"] = tokens
+            update_stats(model=model_name, streaming=False, tokens=tokens)
+            log_request_to_disk(log_entry)
         else:
             response = {
                 "id": request_id, "object": "chat.completion",
@@ -3007,7 +3493,21 @@ button.ghost:hover{background:var(--dim)}
         <button class="ghost" onclick="loadDefaultModel()">刷新</button>
       </div>
       <div style="margin-top:8px;color:var(--dim);font-size:12px">
-        修改后将立即生效，影响所有未指定模型的API请求
+        修改后将立即生效并持久化到 config.json（重启不丢），影响所有未指定模型的API请求；保存时校验模型确已在 TeleAgent 中配置
+      </div>
+    </div>
+    <div style="margin-bottom:12px;padding-top:12px;border-top:1px solid var(--border)">
+      <label>会话模式（未传 session_title 时的默认行为，fork 新增）</label>
+      <div style="display:flex;align-items:center;gap:12px;margin-top:8px">
+        <select id="sessionMode" style="flex:1">
+          <option value="new">每次新建会话（OpenAI 无状态语义，fork 默认）</option>
+          <option value="reuse">按来源复用会话（v1.9.10 及以前行为）</option>
+        </select>
+        <button class="primary" onclick="saveSessionMode()">保存会话模式</button>
+      </div>
+      <div style="margin-top:8px;color:var(--dim);font-size:12px">
+        new：每次请求新建会话，由 super-agent 自动命名；reuse：按来源标签复用会话（上下文延续）。
+        显式传 session_title 的调用方不受此配置影响，始终按标题复用。
       </div>
     </div>
     <div id="defaultModelStatus" style="margin-top:8px"></div>
@@ -3313,11 +3813,12 @@ async function loadDefaultModel() {
     }
     
     document.getElementById('defaultModelStatus').innerHTML = 
-      `<div style="color:var(--green);font-size:12px">当前默认模型: ${currentModel}</div>`;
+      `<div style="color:var(--green);font-size:12px">当前默认模型: ${esc(currentModel)} · 会话模式: ${d.session_mode || 'new'}</div>`;
   } catch(e) {
     document.getElementById('defaultModelStatus').innerHTML = 
       `<div style="color:var(--red);font-size:12px">加载失败: ${e.message}</div>`;
   }
+  loadSessionMode();
 }
 
 async function saveDefaultModel() {
@@ -3335,15 +3836,47 @@ async function saveDefaultModel() {
     
     if (d.success) {
       document.getElementById('defaultModelStatus').innerHTML = 
-        `<div style="color:var(--green);font-size:12px">✓ ${d.message}</div>`;
+        `<div style="color:var(--green);font-size:12px">✓ ${esc(d.message)}</div>`;
       // 刷新仪表盘显示
       loadStatus();
     } else {
       document.getElementById('defaultModelStatus').innerHTML = 
-        `<div style="color:var(--red);font-size:12px">保存失败: ${d.error}</div>`;
+        `<div style="color:var(--red);font-size:12px">保存失败: ${esc(d.error)}</div>`;
     }
   } catch(e) {
     document.getElementById('defaultModelStatus').innerHTML = 
+      `<div style="color:var(--red);font-size:12px">请求失败: ${e.message}</div>`;
+  }
+}
+
+// fork 新增：会话模式读取/保存
+async function loadSessionMode() {
+  try {
+    const r = await fetch(API + '/api/config');
+    const d = await r.json();
+    document.getElementById('sessionMode').value = d.session_mode || 'new';
+  } catch(e) { /* 静默：设置加载失败不阻塞页面 */ }
+}
+
+async function saveSessionMode() {
+  const mode = document.getElementById('sessionMode').value;
+  try {
+    const r = await fetch(API + '/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_mode: mode })
+    });
+    const d = await r.json();
+    if (d.success) {
+      document.getElementById('defaultModelStatus').innerHTML =
+        `<div style="color:var(--green);font-size:12px">✓ ${esc(d.message)}</div>`;
+      loadStatus();
+    } else {
+      document.getElementById('defaultModelStatus').innerHTML =
+        `<div style="color:var(--red);font-size:12px">保存失败: ${esc(d.error)}</div>`;
+    }
+  } catch(e) {
+    document.getElementById('defaultModelStatus').innerHTML =
       `<div style="color:var(--red);font-size:12px">请求失败: ${e.message}</div>`;
   }
 }
@@ -3468,7 +4001,7 @@ async function loadLogs() {
         <td>${callerTag}</td>
         <td style="font-family:monospace;font-size:12px">${esc(l.model||'')}</td>
         <td>${streamTag}</td>
-        <td><span class="tag ${tagClass}">${l.status}</span></td>
+        <td><span class="tag ${tagClass}">${esc(l.status)}</span></td>
         <td title="${esc(l.prompt_preview||'')}">${esc(l.prompt_preview||'')}</td>
         <td title="${esc(l.response_preview||'')}">${esc(l.response_preview||'')}</td>
         <td>${l.duration_ms ? l.duration_ms + 'ms' : '—'}</td>
@@ -3583,10 +4116,15 @@ setInterval(loadStatus, 5000);
 # 主入口
 # ============================================================
 def main():
+    global _PROXY_PORT
     parser = argparse.ArgumentParser(description="TeleAgent OpenAI-Compatible Proxy")
     parser.add_argument("--port", type=int, default=8088, help="监听端口 (默认: 8088)")
     parser.add_argument("--host", default="0.0.0.0", help="监听地址 (默认: 0.0.0.0)")
     args = parser.parse_args()
+    _PROXY_PORT = args.port
+
+    # fork：从 config.json 恢复持久化配置（默认模型 / 会话模式）
+    load_config()
 
     # 验证可以获取 session key
     key = get_session_key()
@@ -3617,23 +4155,25 @@ def main():
 
     print(f"""
 ╔══════════════════════════════════════════════════════════╗
-║     TeleAgent OpenAI-Compatible Proxy Server             ║
+║     TeleAgent OpenAI-Compatible Proxy Server (fork)      ║
 ╠══════════════════════════════════════════════════════════╣
   监听地址: {args.host}:{args.port}
   super-agent: {SUPER_AGENT_BASE}
   可用模型数: {model_count}
-  默认模型: {DEFAULT_PROVIDER}/{DEFAULT_MODEL}
+  默认模型: {get_default_model()}（持久化于 config.json）
+  会话模式: {get_session_mode()}（new=每次新建 / reuse=按来源复用）
 
   端点:
     GET  /v1/models          - 列出模型
     POST /v1/chat/completions - 聊天补全 (支持 stream)
     GET  /health             - 健康检查
+    GET  /api/config         - 读取配置
 
   使用示例:
     curl http://{args.host}:{args.port}/v1/chat/completions \\
       -H "Content-Type: application/json" \\
       -H "Authorization: Bearer any" \\
-      -d '{{"model":"{DEFAULT_PROVIDER}/{DEFAULT_MODEL}","messages":[{{"role":"user","content":"你好"}}]}}'
+      -d '{{"model":"{get_default_model()}","messages":[{{"role":"user","content":"你好"}}]}}'
 ╚══════════════════════════════════════════════════════════╝
     """)
 

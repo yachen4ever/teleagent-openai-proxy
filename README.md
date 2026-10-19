@@ -13,6 +13,8 @@ AIGC:
 
 将 [TeleAgent](https://teleagent.cn) 桌面应用的 super-agent API 转换为 **OpenAI 兼容接口**，任何支持 OpenAI API 的工具/SDK 均可直接接入。
 
+> **Fork 说明（yachen4ever，v1.10.0+）**：默认会话行为改为 OpenAI 无状态语义——未显式传 `session_title` 的请求每次新建会话（由 super-agent 自动命名）；显式传 `session_title` 则直接使用调用方标题并按其复用。默认模型与会话模式可经 Web 控制台（系统页）或 `GET/POST /api/config` 修改，持久化于 `config.json`。默认模型保存时校验确已在 TeleAgent 中配置。变更明细见 [CHANGELOG.md](CHANGELOG.md) 1.10.0。
+
 ## 特性
 
 - **OpenAI 兼容**：标准 `/v1/chat/completions` 和 `/v1/models` 端点

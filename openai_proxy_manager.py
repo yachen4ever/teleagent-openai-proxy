@@ -28,7 +28,7 @@ PLIST_PATH = os.path.expanduser("~/Library/LaunchAgents/com.lizhun.openai-proxy.
 SERVICE_NAME = "com.lizhun.openai-proxy"
 PROXY_URL = "http://127.0.0.1:8088"
 LOG_FILE = "/tmp/openai-proxy.log"
-SCRIPT_PATH = os.path.expanduser("~/Desktop/星小辰工作空间/openai-proxy/openai_proxy.py")
+SCRIPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "openai_proxy.py")
 
 # 颜色输出
 GREEN = "\033[92m"
