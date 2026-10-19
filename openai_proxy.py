@@ -70,6 +70,9 @@ _SESSION_MODES = (SESSION_MODE_NEW, SESSION_MODE_REUSE)
 
 _dynamic_session_mode = SESSION_MODE_NEW
 
+# 配置写盘互斥（与模型/模式内存锁分离，避免写盘阻塞读路径）
+_config_write_lock = threading.Lock()
+
 
 def get_session_mode():
     """获取当前会话模式"""
@@ -109,17 +112,20 @@ def load_config():
 
 
 def save_config():
-    """将当前配置写入 config.json"""
-    try:
-        with _default_model_lock:
-            data = {
-                "default_model": f"{_dynamic_default_provider}/{_dynamic_default_model}",
-                "session_mode": _dynamic_session_mode,
-            }
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"[CONFIG] 配置保存失败: {e}", file=sys.stderr)
+    """将当前配置写入 config.json（v1.10.1：写入锁内快照 + temp+rename 原子替换）"""
+    with _config_write_lock:
+        try:
+            with _default_model_lock:
+                data = {
+                    "default_model": f"{_dynamic_default_provider}/{_dynamic_default_model}",
+                    "session_mode": _dynamic_session_mode,
+                }
+            tmp = CONFIG_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, CONFIG_PATH)
+        except Exception as e:
+            print(f"[CONFIG] 配置保存失败: {e}", file=sys.stderr)
 
 
 # 动态默认模型管理函数
@@ -1059,9 +1065,11 @@ def get_or_create_session(directory=DEFAULT_DIRECTORY, title=None):
         return sid, False
 
 
-# 会话级互斥：同一会话上的补全请求串行执行。
+# 会话级互斥：同一"可复用"会话上的补全请求串行执行。
 # 每个请求都独立订阅 /global/event 并按 sessionID 过滤，并发写同一会话时
 # 两个监听器会同时收到全部文本增量，导致每个客户端收到两份回答的混合内容。
+# 注意：仅复用语义（显式标题/reuse 模式/预热）需要锁——new 模式每请求
+# 创建唯一 session，天然无并发共享，加锁只会无谓膨胀字典（v1.10.1 修正）。
 _session_prompt_locks = {}
 _session_prompt_locks_lock = threading.Lock()
 
@@ -1072,9 +1080,15 @@ def _acquire_session_lock(session_id):
         lock = _session_prompt_locks.get(session_id)
         if lock is None:
             lock = threading.Lock()
-            # 简单防膨胀：锁条目超限时清掉全部（锁重建只影响串行化粒度，不影响正确性）
+            # 防膨胀：仅在锁"当前无人持有"时逐出（v1.10.1 修正——
+            # 原实现的 clear() 会清掉正被持有的锁，使同会话请求绕过互斥）
             if len(_session_prompt_locks) > 500:
-                _session_prompt_locks.clear()
+                for k in list(_session_prompt_locks.keys()):
+                    candidate = _session_prompt_locks[k]
+                    if not candidate.acquire(blocking=False):
+                        continue
+                    candidate.release()
+                    _session_prompt_locks.pop(k, None)
             _session_prompt_locks[session_id] = lock
     return lock
 
@@ -1144,12 +1158,30 @@ def send_prompt_async(session_id, messages, directory=DEFAULT_DIRECTORY,
                             text_parts.append("[图片解析失败]")
                     elif img_url.startswith(("http://", "https://")):
                         # fork：尝试下载 http(s) 图片到本地（原实现静默丢弃）
+                        # v1.10.1：SSRF 防护——拒绝解析到内网/保留地址的主机，限制下载体积
                         try:
+                            from urllib.parse import urlparse as _urlparse
+                            import ipaddress as _ip
+                            _host = _urlparse(img_url).hostname or ""
+                            _bad = False
+                            for _info in socket.getaddrinfo(_host, None):
+                                try:
+                                    _a = _ip.ip_address(_info[4][0])
+                                    if (_a.is_private or _a.is_loopback or _a.is_link_local
+                                            or _a.is_reserved or _a.is_multicast):
+                                        _bad = True
+                                        break
+                                except ValueError:
+                                    continue
+                            if _bad or not _host:
+                                raise ValueError("目标地址为内网/保留地址，已拒绝下载")
                             dl_req = urllib.request.Request(
                                 img_url, headers={"User-Agent": "Mozilla/5.0"}, method="GET"
                             )
                             with urllib.request.urlopen(dl_req, timeout=15) as img_resp:
-                                img_bytes = img_resp.read()
+                                img_bytes = img_resp.read(20 * 1024 * 1024 + 1)
+                                if len(img_bytes) > 20 * 1024 * 1024:
+                                    raise ValueError("图片超过 20MB 大小上限")
                                 m_ct = re.search(r"image/([\w+-]+)", (img_resp.headers.get("Content-Type") or ""))
                                 suffix = f".{m_ct.group(1)}" if m_ct else ".jpg"
                             img_path = os.path.join("/tmp/reachy_vision", f"proxy_{int(time.time()*1000)}{suffix}")
@@ -2021,15 +2053,20 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         try:
             content_length = int(self.headers.get("Content-Length", 0) or 0)
         except (TypeError, ValueError):
+            # HTTP/1.1 keep-alive：请求体未读时连接不可复用，直接关闭
+            self.close_connection = True
             self._send_json(400, {"error": {"message": "invalid Content-Length", "type": "invalid_request_error"}})
             return None
         if content_length > self.MAX_BODY:
+            # 超限体积无法排空，必须关闭连接防毒化后续请求
+            self.close_connection = True
             self._send_json(413, {"error": {"message": "request body too large", "type": "invalid_request_error"}})
             return None
         try:
             return self.rfile.read(content_length) if content_length > 0 else b""
         except Exception:
             self.client_gone = True
+            self.close_connection = True
             return None
 
     def _send_json(self, status, data):
@@ -2046,15 +2083,21 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             return False
 
     def _send_sse_headers(self):
-        """发送 SSE 流式响应的 HTTP 头"""
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        # SSE 无 Content-Length，HTTP/1.1 下以关闭连接收尾（流结束即 EOF）
-        self.send_header("Connection", "close")
-        self.send_header("X-Accel-Buffering", "no")
-        self.end_headers()
-        self.close_connection = True
+        """发送 SSE 流式响应的 HTTP 头；写回失败返回 False（客户端已断开）"""
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            # SSE 无 Content-Length，HTTP/1.1 下以关闭连接收尾（流结束即 EOF）
+            self.send_header("Connection", "close")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            self.close_connection = True
+            return True
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            self.client_gone = True
+            self.close_connection = True
+            return False
 
     def _send_sse_chunk(self, data):
         chunk = f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
@@ -2120,6 +2163,18 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         elif path == "/api/permission/inject":
             self._handle_permission_inject()
         else:
+            # HTTP/1.1 keep-alive：未读的请求体会毒化连接复用，先排空小体积 body
+            try:
+                _cl = int(self.headers.get("Content-Length", 0) or 0)
+            except (TypeError, ValueError):
+                _cl = 0
+            if _cl > 1024 * 1024:
+                self.close_connection = True
+            elif _cl > 0:
+                try:
+                    self.rfile.read(_cl)
+                except Exception:
+                    self.close_connection = True
             self._send_json(404, {"error": {"message": "Not found", "type": "invalid_request_error"}})
 
     # ======== 管理 API ========
@@ -2348,24 +2403,34 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         if not session_id:
             self._send_json(500, {"error": "Failed to create session"})
             return
-        start_ts = time.time()
-        listener = StreamingSSEListener(
-            session_id, on_delta=lambda t: None, on_complete=lambda: None,
-            on_error=lambda e: None, timeout=120
-        )
-        sse_thread = threading.Thread(target=listener.listen)
-        sse_thread.daemon = True
-        sse_thread.start()
-        time.sleep(0.5)
-        send_prompt_async(session_id, [{"role": "user", "content": prompt}],
-                          DEFAULT_DIRECTORY, provider_id, model_id)
-        sse_thread.join(timeout=120)
-        text = listener.get_full_text()
-        duration = int((time.time() - start_ts) * 1000)
-        self._send_json(200, {
-            "model": model, "prompt": prompt, "response": text,
-            "tokens": listener.tokens, "duration_ms": duration, "error": listener.error,
-        })
+        # v1.10.1：按天复用的测试会话加会话锁——并发测试会让两个监听器
+        # 同时订阅同一会话，返回混合文本
+        session_lock = _acquire_session_lock(session_id)
+        if not session_lock.acquire(timeout=5):
+            self._send_json(503, {"error": "已有面板测试在执行，请稍候"})
+            return
+        try:
+            start_ts = time.time()
+            listener = StreamingSSEListener(
+                session_id, on_delta=lambda t: None, on_complete=lambda: None,
+                on_error=lambda e: None, timeout=120
+            )
+            sse_thread = threading.Thread(target=listener.listen)
+            sse_thread.daemon = True
+            sse_thread.start()
+            time.sleep(0.5)
+            send_prompt_async(session_id, [{"role": "user", "content": prompt}],
+                              DEFAULT_DIRECTORY, provider_id, model_id)
+            sse_thread.join(timeout=120)
+            listener.stop()
+            text = listener.get_full_text()
+            duration = int((time.time() - start_ts) * 1000)
+            self._send_json(200, {
+                "model": model, "prompt": prompt, "response": text,
+                "tokens": listener.tokens, "duration_ms": duration, "error": listener.error,
+            })
+        finally:
+            session_lock.release()
 
     # ======== 权限/问题确认 API（机器人侧"群里确认/拒绝"） ========
 
@@ -2746,13 +2811,17 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": {"message": "Failed to create session", "type": "server_error"}})
             return
 
-        # fork：同一会话上的补全请求串行执行——两个监听器都订阅 /global/event，
-        # 并发写同一会话会导致每个客户端收到两份回答的混合内容
-        session_lock = _acquire_session_lock(session_id)
-        if not session_lock.acquire(timeout=120):
-            self._send_json(503, {"error": {"message": "同一会话上已有请求在处理，请稍后重试",
-                                            "type": "server_error"}})
-            return
+        # fork：同一"可复用"会话上的补全请求串行执行——两个监听器都订阅
+        # /global/event，并发写同一会话会导致每个客户端收到两份回答的混合内容。
+        # new 模式（无标题）每请求创建唯一 session，无需加锁（v1.10.1）
+        reuse_semantics = (explicit_title or is_warmup
+                           or get_session_mode() == SESSION_MODE_REUSE)
+        if reuse_semantics:
+            session_lock = _acquire_session_lock(session_id)
+            if not session_lock.acquire(timeout=120):
+                self._send_json(503, {"error": {"message": "同一会话上已有请求在处理，请稍后重试",
+                                                "type": "server_error"}})
+                return
         try:
             self._dispatch_completion(
                 session_id, messages, stream, provider_id, model_id,
@@ -2766,7 +2835,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 tools=tools, stream_options=stream_options,
             )
         finally:
-            session_lock.release()
+            if reuse_semantics:
+                session_lock.release()
 
     def _dispatch_completion(self, session_id, messages, stream, provider_id, model_id,
                              session_title, explicit_title, source_tag, source_detail,
@@ -2826,9 +2896,16 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                                   provider_id, model_id, log_entry, start_time,
                                   stream_options=None, tools=None, session_reused=False):
         """流式响应（带日志），支持 tool call 检测"""
-        # 发送 SSE 响应头
-        self._send_sse_headers()
+        # 发送 SSE 响应头（v1.10.1：写回失败不再冲出方法——
+        # 会话创建/反查期间客户端断开时保证日志兜底仍执行）
         model_name = f"{provider_id}/{model_id}"
+        if not self._send_sse_headers():
+            log_entry["status"] = "client_disconnected"
+            log_entry["error"] = "客户端断开（响应头写回失败）"
+            log_entry["duration_ms"] = int((time.time() - start_time) * 1000)
+            update_stats(model=model_name, streaming=True, error=False)
+            log_request_to_disk(log_entry)
+            return
         first_chunk_sent = False
         collected_text = []
         collected_tokens = None
@@ -2837,13 +2914,17 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         # fork：终态锁存——send_error / send_complete 只允许其一执行，
         # 避免上游报错后 session idle 又触发 complete，产生双 [DONE] 与统计双计
         terminal = {"sent": False}
+        terminal_lock = threading.Lock()
 
         def _terminal_begin():
-            if terminal["sent"] or self.client_gone:
+            # v1.10.1：check-then-set 改为锁内原子操作，
+            # 堵住 listener 回调与主线程超时路径的竞态窗口
+            with terminal_lock:
+                if terminal["sent"] or self.client_gone:
+                    terminal["sent"] = True
+                    return False
                 terminal["sent"] = True
-                return False
-            terminal["sent"] = True
-            return True
+                return True
 
         # Tool call 检测状态
         # 当 tools 参数存在时，始终缓冲完整响应再解析（LLM 可能在 tool call 前加对话文字）
@@ -3019,10 +3100,13 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
         def send_error(err):
             nonlocal has_error
+            err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+            # v1.10.1：无论终态块是否已发（如客户端已断开），错误本身必须记账，
+            # 防止"断开与上游错误同时发生"时错误被记成干净断连
+            has_error = True
+            log_entry["error"] = err_msg
             if not _terminal_begin():
                 return
-            has_error = True
-            err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
             error_chunk = {
                 "id": request_id, "object": "chat.completion.chunk",
                 "created": created, "model": model_name,
@@ -3031,7 +3115,6 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             self._send_sse_chunk(error_chunk)
             self._send_sse_end()
             log_entry["status"] = "error"
-            log_entry["error"] = err_msg
             log_entry["duration_ms"] = int((time.time() - start_time) * 1000)
             update_stats(model=model_name, streaming=True, error=True)
             log_request_to_disk(log_entry)
