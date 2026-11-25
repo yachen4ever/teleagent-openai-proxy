@@ -8,3 +8,7 @@ __pycache__/
 venv/
 logs/
 config.json
+session.key
+session.key.*
+*.core
+*.pcap

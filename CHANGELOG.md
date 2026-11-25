@@ -11,8 +11,68 @@ AIGC:
 
 # Changelog
 
-本项目的所有重要变更记录在此文件中。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
-版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
+## [3.0.0] - 2026-11-26
+
+极简重写 + TeleAgent 3.x 密钥机制适配。以 fork v1.10.1 为基座合入上游 2.0.0 的密钥层，
+而不是反向从上游拉取——上游 2.0.0 的代码基线仍是 1.9.10，本 fork 自 1.10.0 起的 25 项
+稳定性修复一条都没有合入（逐条 grep 证据见 docs/上游2.0.0审计报告.md）。
+
+### 新增文件
+
+- `openai_proxy_v3.py`：极简单文件代理，只保留 `/v1/chat/completions`、`/v1/models`、`/health`
+- `extract_sa_key.py`（由 `extract_sa_key_v3.py` 部署时改名）：3.x 密钥提取，继承上游方案并修正两处
+- `tests/test_proxy_v3.py`：27 项标准库单测
+- `docs/上游2.0.0审计报告.md`：上游代码级审计与取舍说明
+- `README-v3.md`：v3 部署与行为约定
+
+### TeleAgent 3.x 密钥机制适配
+
+- **密钥只在 ais 内存**：真机实测（y430p / 3.1.1）super-agent 环境变量仅 HOME/PATH/TMPDIR，
+  ais 环境变量 50 项全为 AIS_*；磁盘扫描 2744 个候选逐个验签命中 0。
+  故采用「tcpdump 真实样本 + ais 堆转储验签」提取（22s 抓包 + 29.8MB 转储，全程 38s）
+- **密钥优先级**：环境变量 → `session.key` → 旧 scheduler 环境（2.x 兼容）
+- **401/403 自愈**：真机验证通过（写入无效 key 后首个请求自动重提取并恢复）
+- **修正上游自愈顺序缺陷**：上游先重读 `session.key`（文件里正是刚被判无效的旧值）
+  再跑提取器，导致自愈静默失效；本版改为先跑提取器，提取器不可用才退回重读文件
+- **修正 core 转储权限**：lldb 以 root 转储，文件归 root；本版 chown 后以 0600 读取，用完即删
+
+### 删减（复杂度过高且非自用所需）
+
+- 删除 Web 控制台与 `/api/*` 全套（status/models/logs/sessions/stats/default-model/config/test）
+- 删除 `/api/permission/inject`（可注入伪造确认，进而推送到机器人通道）
+- 删除 `/v1/embeddings`（转发本地 Ollama/vLLM，与本项目定位无关）
+- 删除 `identify_caller_process` 全套（lsof/ps/万达云穿透）、来源标签、
+  `build_source_session_title`——这是「脚本|PID|日期|时间」这类人工标题痕迹的唯一来源，
+  删除后所有会话由 super-agent 自动命名，最接近原生使用形态
+- 删除 `[TOOL_CALL]` 文本协议与 `_build_tool_prompt`（上游只有纯文本 prompt 通道，
+  客户端工具回路打不通；注入工具描述既污染上下文又是反代特征）
+- 删除 http(s) 图片代下载（SSRF 面 + 非原生行为），只保留 data URI
+
+### 新增能力
+
+- **Bearer 鉴权**（常数时间比对，fail-closed），默认监听 `127.0.0.1`（原默认 0.0.0.0 无鉴权）
+- **reasoning 透传**：上游 `reasoning` part → OpenAI `reasoning_content`
+  （流式 `delta.reasoning_content` / 非流式顶层字段），与 content 分流不混
+- **usage 口径修正**：上游 `total = input + output + cache.read`，
+  故 `prompt_tokens = input + cache.read`，并输出 `cached_tokens` 与 `reasoning_tokens`
+- **确认自动答复**：`permission.asked`/`question.asked` 自动回 `once`（可配置关闭），
+  避免通用客户端在确认场景挂死到超时
+- **全局在飞上限**（默认 2）：模拟单人使用节奏，保护上游并降低异常用量曲线
+- **断连记账修正**：客户端先断开时记 `client_disconnected` 而非 `response timeout`，
+  且不再空等满 600s（3.1s 收尾）
+- **启动不因上游暂时不可用而退出**：TeleAgent 正在重启换 key 时仍可启动，由首请求自愈
+
+### 保留的稳定性修复（自 v1.10.x）
+
+SSE 增量 UTF-8 解码（真机 640 字中文零 U+FFFD）、SSE 握手状态行校验、终态锁存（禁止双 [DONE]）、
+写回异常安全、会话级串行化、兜底取历史消息的时间过滤、日志纯追加、入参类型校验、
+请求体上限、凭据脱敏。
+
+### 真机验收（y430p / TeleAgent 3.1.1 / macOS 13.7.8 x86_64）
+
+密钥提取、非流式、流式（178 chunk/640 字零乱码）、reasoning 透传、include_usage、
+多轮复用（第 2 轮只发问题即答出第 1 轮数字）、客户端断开、401 自愈、鉴权拒绝、
+监听面（仅 4397 + 127.0.0.1:8088）全部通过。
 
 ## [1.10.0] - 2026-10-19
 

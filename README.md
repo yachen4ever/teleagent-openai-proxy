@@ -9,202 +9,127 @@ AIGC:
   ReservedCode2: 'f5a009ce-34c5-4d59-8c67-b58a2ed012ff'
 ---
 
-# TeleAgent OpenAI-Compatible Proxy
+# TeleAgent OpenAI-Compatible Proxy · 极简版 v3.0.0
 
-将 [TeleAgent](https://teleagent.cn) 桌面应用的 super-agent API 转换为 **OpenAI 兼容接口**，任何支持 OpenAI API 的工具/SDK 均可直接接入。
+把本地 [TeleAgent](https://teleagent.cn)（**3.1.x**）的 super-agent 暴露成 OpenAI 兼容接口。
+纯 Python 标准库，零第三方依赖，两个文件即可部署。
 
-> **Fork 说明（yachen4ever，v1.10.0+）**：默认会话行为改为 OpenAI 无状态语义——未显式传 `session_title` 的请求每次新建会话（由 super-agent 自动命名）；显式传 `session_title` 则直接使用调用方标题并按其复用。默认模型与会话模式可经 Web 控制台（系统页）或 `GET/POST /api/config` 修改，持久化于 `config.json`。默认模型保存时校验确已在 TeleAgent 中配置。变更明细见 [CHANGELOG.md](CHANGELOG.md) 1.10.0。
+> **v3.0.0 是一次重写，不是增量**：只有一个文件 `openai_proxy_v3.py`，
+> 只保留 `/v1/chat/completions`、`/v1/models`、`/health`。
+> 控制台、embeddings、来源追踪、tool 文本协议、确认注入接口全部删除。
+> 取舍与理由见 [docs/上游2.0.0审计报告.md](docs/上游2.0.0审计报告.md)。
 
-## 特性
+## 为什么需要它
 
-- **OpenAI 兼容**：标准 `/v1/chat/completions` 和 `/v1/models` 端点
-- **流式 & 非流式**：支持 SSE 流式输出和一次性返回
-- **多轮对话**：通过 messages 数组传入完整历史
-- **自动签名**：自动从运行中的 scheduler 进程获取 session key
-- **模型管理**：只展示 TeleAgent 中已配置成功的 Provider 与模型（未配置密钥的内置模型目录自动隐藏），TeleAgent 新增配置后面板每 30 秒自动同步
-- **默认模型可切换**：Web 控制台可动态修改默认模型，立即生效，影响所有未显式指定 `model` 的 API 请求
-- **Web 控制台**：内置仪表盘、模型管理、请求日志、在线测试、会话管理
-- **持久化运行**：通过 macOS launchd 开机自启、崩溃自动重启
-- **零依赖**：纯 Python 标准库实现，无需 pip install
+TeleAgent 3.x 把签名密钥从「进程环境变量」搬到了 `ais` 进程的内存里（经 stdin boot handoff 注入，
+不落盘、不进 env）。所以旧版代理「读 scheduler 环境变量」的路径彻底失效，
+必须用 `extract_sa_key.py` 现场提取一次，之后代理就能长期无特权运行。
 
-## 快速开始
-
-### 前置条件
-
-- macOS（依赖 TeleAgent 桌面应用运行中的 super-agent）
-- Python 3.8+（推荐 [Homebrew Python 3.11](https://brew.sh)，具备完整 TCC 权限）
-
-> **TCC 权限提示**：macOS 的 `~/Desktop`、`~/Documents`、`~/Downloads` 受 TCC 隐私保护。通过 `launchd` 持久化运行的服务需要使用已获得 TCC 授权的 Python 解释器（如 Homebrew 安装的 Python 3.11+），否则会遇到 `Operation not permitted` 错误。如果脚本放在 `/tmp` 或 `~/scripts` 等非受保护目录，则无此限制。
-
-### 启动代理
+## 部署（以 macOS 为例）
 
 ```bash
-python3 openai_proxy.py --port 8088 --host 0.0.0.0
+mkdir -p ~/code/teleagent-openai-proxy-v3
+cp openai_proxy_v3.py extract_sa_key_v3.py ~/code/teleagent-openai-proxy-v3/
+cd ~/code/teleagent-openai-proxy-v3
+mv extract_sa_key_v3.py extract_sa_key.py     # 代理按这个名字找它
+
+# 1) 提取密钥（需 sudo：tcpdump + lldb，约 40 秒；密钥只写本地 session.key 0600）
+python3 extract_sa_key.py
+
+# 2) 自检（不启动服务）
+python3 openai_proxy_v3.py --check
+
+# 3) 启动
+python3 openai_proxy_v3.py            # 默认 127.0.0.1:8088
 ```
 
-### 调用示例
+首次启动会生成 `config.json`（0600），里面自动带一个随机 `api_key`，用它调用即可。
+
+## 调用
 
 ```bash
-# 非流式
+KEY=$(python3 -c "import json;print(json.load(open('config.json'))['api_key'])")
+
 curl http://127.0.0.1:8088/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" \
   -H "Content-Type: application/json" \
-  -d '{
-    "model": "NewApi/chat-pro",
-    "messages": [{"role": "user", "content": "你好"}]
-  }'
-
-# 流式
-curl -N http://127.0.0.1:8088/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "NewApi/chat-pro",
-    "messages": [{"role": "user", "content": "讲个笑话"}],
-    "stream": true
-  }'
-
-# 获取模型列表
-curl http://127.0.0.1:8088/v1/models
+  -d '{"model":"NewApi/chat-pro","messages":[{"role":"user","content":"你好"}]}'
 ```
 
-### Python SDK
+Python SDK：
 
 ```python
 from openai import OpenAI
-
-client = OpenAI(
-    base_url="http://127.0.0.1:8088/v1",
-    api_key="any"  # 随意填，不校验
-)
-
-resp = client.chat.completions.create(
+client = OpenAI(base_url="http://127.0.0.1:8088/v1", api_key=KEY)
+r = client.chat.completions.create(
     model="NewApi/chat-pro",
-    messages=[{"role": "user", "content": "你好"}]
+    messages=[{"role": "user", "content": "你好"}],
+    extra_body={"session_title": "我的会话"},   # 可选：传了就按标题复用上下文
 )
-print(resp.choices[0].message.content)
 ```
 
-## 接入第三方工具
+## 行为约定
 
-| 配置项 | 值 |
-|--------|-----|
-| API Base URL | `http://127.0.0.1:8088/v1` |
-| API Key | `any`（随意填写） |
-| 模型名 | `NewApi/chat-pro` |
+| 项 | 行为 |
+|---|---|
+| 未传 `session_title` | **每次新建会话**，由 super-agent 自动命名（OpenAI 无状态语义） |
+| 传了 `session_title` | 按标题复用已有会话；复用时只发最新一条消息（避免上下文双重累积） |
+| 思考内容 | 上游 `reasoning` part 以 `reasoning_content` 下发（流式 delta / 非流式字段） |
+| `include_usage` | 返回真实 token 数，`prompt_tokens = input + cache.read`，含 `cached_tokens` |
+| 权限/问题确认 | 自动回 `once`（`config.json` 的 `auto_approve` 可关），避免客户端挂死 |
+| 图片 | 只支持 `data:` URI；落临时文件后提示模型用 `image_understanding` 查看 |
+| 工具调用 | **不注入 tools**。上游只有纯文本 prompt 通道，需要 function calling 请直连 |
+| 密钥失效 | 401 时自动跑提取器刷新（90 秒节流 + 文件锁），TeleAgent 重启换 key 无需人工干预 |
 
-已验证可接入：OpenAI Python SDK、LangChain、Cursor、Continue、ChatBox、NextChat 等。
+## config.json
 
-## Web 控制台
+```json
+{
+  "api_key": "sk-local-…",          // 调用方鉴权（Bearer），自动生成，可改
+  "default_model": "NewApi/chat-pro",
+  "auto_approve": true,              // 确认请求自动答复
+  "max_inflight": 2,                 // 全局并发上限（模拟单人节奏，保护上游）
+  "listen_host": "127.0.0.1",        // 只监听本机
+  "listen_port": 8088
+}
+```
 
-访问 `http://127.0.0.1:8088/console` 即可使用：
+## 关于"反代检测"
 
-- **仪表盘**：实时统计（请求数/Token/错误率）、服务状态、模型调用统计
-- **模型管理**：浏览 TeleAgent 中已配置成功的模型（按 Provider 分组），新增配置自动同步
-- **默认模型设置**：在「系统」页修改默认模型，保存后立即生效
-- **请求日志**：查看最近 200 条请求的时间/模型/状态/耗时/Token
-- **在线测试**：直接在页面发送请求并查看响应
-- **会话管理**：查看 super-agent 创建的会话列表
-- **系统信息**：版本、签名机制、API 端点文档
-- **使用说明**：内置完整使用文档，含代码示例和一键复制
+本方案**不做任何指纹伪装**：不改 device-meta/installId/UA，不代下载外部图片，
+不写人工会话标题。云端请求始终由官方 Go 二进制自己发出，所以厂商看到的就是官方客户端。
+残余可观测性主要在"用量曲线"（单账户高频会异常），因此请按自用级频率使用。
+详细分析见审计报告第四节。
 
-## 持久化运行（macOS launchd）
+## 常驻运行（launchd）
 
 ```bash
-# 创建 launchd 配置
-cat > ~/Library/LaunchAgents/com.lizhun.openai-proxy.plist << 'EOF'
+cat > ~/Library/LaunchAgents/io.local.teleagent-proxy-v3.plist <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.lizhun.openai-proxy</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/opt/homebrew/Cellar/python@3.11/3.11.15/Frameworks/Python.framework/Versions/3.11/bin/python3.11</string>
-        <string>/Users/YOUR_USERNAME/scripts/openai_proxy.py</string>
-        <string>--port</string>
-        <string>8088</string>
-        <string>--host</string>
-        <string>0.0.0.0</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/tmp/openai-proxy.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/openai-proxy.log</string>
-</dict>
-</plist>
-EOF
-
-# 加载服务
-launchctl load ~/Library/LaunchAgents/com.lizhun.openai-proxy.plist
-
-# 查看状态
-launchctl list | grep openai-proxy
-
-# 重启服务
-launchctl unload ~/Library/LaunchAgents/com.lizhun.openai-proxy.plist
-launchctl load ~/Library/LaunchAgents/com.lizhun.openai-proxy.plist
+<plist version="1.0"><dict>
+  <key>Label</key><string>io.local.teleagent-proxy-v3</string>
+  <key>ProgramArguments</key><array>
+    <string>/usr/bin/python3</string>
+    <string>REPLACE_ME/openai_proxy_v3.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>REPLACE_ME</string>
+  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+</dict></plist>
+PLIST
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.local.teleagent-proxy-v3.plist
 ```
 
-## 工作原理
+## 测试
 
-```
-┌──────────────┐     OpenAI 格式      ┌───────────────┐     签名请求      ┌─────────────────┐
-│  客户端/SDK   │ ──────────────────→ │  代理 (8088)   │ ──────────────→ │  super-agent     │
-│  (curl/SDK)  │ ←────────────────── │  (Python)     │ ←────────────── │  (4397)          │
-└──────────────┘    流式 SSE / JSON   └───────────────┘   SSE 事件流     └─────────────────┘
-                                                                            │
-                                                                    ┌───────┴───────┐
-                                                                    │  TeleAgent     │
-                                                                    │  桌面应用       │
-                                                                    └───────────────┘
+```bash
+python3 -m unittest discover -s tests -v    # 27 项，无第三方依赖
 ```
 
-1. 客户端发送标准 OpenAI 格式请求到代理
-2. 代理创建 super-agent 会话，启动 SSE 事件监听
-3. 代理通过 `POST /session/{id}/prompt_async` 异步发送消息
-4. 代理监听 `/global/event` SSE 事件流，收集 assistant 回复
-5. 代理将回复转换为 OpenAI 格式返回（流式或非流式）
+## 与上游的关系
 
-### 签名机制
-
-代理自动从 scheduler 进程环境变量中提取 `SUPER_AGENT_LOCAL_SESSION_KEY`，使用 HMAC-SHA256 + base64url 生成签名头：
-
-```
-payload = "\n".join(["local-v1", method, path_with_query, timestamp_ms, nonce])
-signature = HMAC-SHA256(session_key, payload).digest("base64url")
-```
-
-请求头：`X-SA-Sign-Version`, `X-SA-Timestamp`, `X-SA-Nonce`, `X-SA-Signature`
-
-## API 端点
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/v1/models` | 获取模型列表 (OpenAI 兼容) |
-| POST | `/v1/chat/completions` | 聊天补全，支持 stream (OpenAI 兼容) |
-| GET | `/health` | 健康检查 |
-| GET | `/console` | Web 控制台页面 |
-| GET | `/api/status` | 代理服务状态 |
-| GET | `/api/models` | 详细模型列表（仅含 TeleAgent 已配置的 Provider/模型） |
-| GET | `/api/default-model` | 获取当前默认模型 |
-| POST | `/api/default-model` | 修改默认模型（立即生效） |
-| GET | `/api/logs` | 请求日志 |
-| GET | `/api/sessions` | super-agent 会话列表 |
-| GET | `/api/stats` | 统计数据 |
-| POST | `/api/test` | 在线测试接口 |
-
-## 技术细节
-
-- **零依赖**：纯 Python 标准库（`http.server`, `hmac`, `json`, `threading`），无第三方包
-- **线程安全**：每个请求独立线程处理，SSE 监听器在子线程运行
-- **会话隔离**：每次 API 请求创建独立的 super-agent 会话
-- **日志环形缓冲**：保留最近 200 条请求日志
-- **Token 统计**：从 SSE 事件中提取输入/输出/推理/缓存 token
-
-## License
-
-MIT
+本仓库是 [lizhun781021/teleagent-openai-proxy](https://github.com/lizhun781021/teleagent-openai-proxy)
+的 fork。上游 2.0.0 提供了 3.x 密钥提取的正确方案（本版继承），但其代码基线仍是 1.9.10，
+缺少本 fork 自 v1.10.0 起积累的 25 项稳定性修复（增量 UTF-8、SSE 状态行校验、终态锁存、
+断连收尾、会话串行化、兜底时间过滤等）。因此 v3.0.0 以本 fork 为基座合入密钥层，
+而不是反向从上游拉取。逐条证据见审计报告第二节。
