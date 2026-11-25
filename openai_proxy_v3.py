@@ -589,22 +589,186 @@ def extract_assistant_text(messages, min_time=None):
 
 
 # ============================================================
-# 确认请求自动答复（避免 API 客户端挂死）
+# 确认请求自动答复（避免 agent 会话永久挂起）
 # ============================================================
-def reply_confirmation(conf_id, kind, decision="once"):
+# 重要教训（2026-11-26 真机实证）：
+#   客户端断开 ≠ 上游停止。TeleAgent 会话是**非幂等 agent**，请求返回后它仍会
+#   继续执行，并在中途弹 question.asked 等待人工回答。若此时无人应答，该会话会
+#   永久停在"运行中"，直到 App 重启才变成"已失效"（用户实际踩到）。
+#   因此确认必须由代理在**后台**独立应答，不能依赖某个 HTTP 请求还活着。
+
+
+def _pick_question_answers(props):
+    """从 question.asked 事件给每道题选第一个选项，返回 [[...], [...]]。
+
+    真机实测 3.1.1 结构（2026-11-26）：
+      props["questions"] = [{"question": "...", "header": "...",
+                             "options": [{"label": "...", "description": "..."}]}]
+      props["tool"] = {"messageID": ..., "callID": ...}   ← 不含选项
+    旧版/兼容位置可能是 props["tool"]["input"]["questions"]。
+
+    答复格式（上游 Go 二进制字符串实证）：
+      answers 是 **[][]string**（每题一个字符串数组），值必须是选项的 **label**；
+      传 []string 会 400：`Mismatch type []string with value string`。
+      单选用单元素数组，多选题可放多个 label。
+    """
+    questions = None
+    if isinstance(props.get("questions"), list):
+        questions = props["questions"]
+    if not questions:
+        tool = props.get("tool") or {}
+        if isinstance(tool, dict):
+            inner = tool.get("input") or {}
+            if isinstance(inner, dict) and isinstance(inner.get("questions"), list):
+                questions = inner["questions"]
+    if not questions:
+        return None
+
+    answers = []
+    for q in questions:
+        if not isinstance(q, dict):
+            return None
+        chosen = None
+        for o in (q.get("options") or []):
+            if isinstance(o, str) and o.strip():
+                chosen = o.strip()
+                break
+            if isinstance(o, dict):
+                for k in ("label", "value", "text", "name"):
+                    v = o.get(k)
+                    if isinstance(v, str) and v.strip():
+                        chosen = v.strip()
+                        break
+            if chosen:
+                break
+        if chosen is None:
+            return None          # 有一题选不出就不答，避免半套答案被上游拒
+        answers.append([chosen])  # 每题一个数组（单选取第一个）
+    return answers
+
+
+def reply_confirmation(conf_id, kind, props=None, decision="once"):
+    """答复确认。question 必须带真实选项，取不到就如实记录失败。"""
     if not conf_id:
         return False
     if kind == "question":
-        # 问题类需要答案列表；自动批准场景下用第一个选项
-        answers = ["确认"]
-        status, _, _ = sa_request("POST", f"/question/{conf_id}/reply",
-                                  {"answers": answers}, timeout=15)
+        answers = _pick_question_answers(props or {})
+        if not answers:
+            print(f"[CONF] question {conf_id} 无可用选项，无法自动答复（保留待人工处理）",
+                  file=sys.stderr)
+            return False
+        status, resp, _ = sa_request("POST", f"/question/{conf_id}/reply",
+                                     {"answers": answers}, timeout=15)
     else:
-        status, _, _ = sa_request("POST", f"/permission/{conf_id}/reply",
-                                  {"reply": decision}, timeout=15)
+        status, resp, _ = sa_request("POST", f"/permission/{conf_id}/reply",
+                                     {"reply": decision}, timeout=15)
+        answers = None
     ok = status in (200, 204)
-    print(f"[CONF] 自动答复 {kind} id={conf_id} decision={decision} -> {status}", file=sys.stderr)
+    print(f"[CONF] {kind} id={conf_id} answers={answers} decision={decision} -> {status}"
+          f"{'' if ok else '；resp=' + str(resp)[:120]}", file=sys.stderr)
     return ok
+
+
+# ------------------------------------------------------------
+# 后台确认守护线程：与会话请求解耦
+# ------------------------------------------------------------
+# 每个 chat 请求的 SSEListener 也可能看到确认事件，但客户端断开后它就停了；
+# 这个常驻线程订阅 /global/event，独立处理所有会话的确认，是最后一道兜底。
+_class_conf_guard = {"thread": None, "seen": set(), "lock": threading.Lock()}
+
+
+def _conf_guard_loop():
+    while True:
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(10)
+            sock.connect((SUPER_AGENT_HOST, SUPER_AGENT_PORT))
+            headers = sign_request("GET", "/global/event")
+            headers["Accept"] = "text/event-stream"
+            headers["Host"] = f"{SUPER_AGENT_HOST}:{SUPER_AGENT_PORT}"
+            req = "GET /global/event HTTP/1.1\r\n" + "".join(
+                f"{k}: {v}\r\n" for k, v in headers.items()) + "Connection: keep-alive\r\n\r\n"
+            sock.sendall(req.encode())
+            print("[CONF-GUARD] 已连接 /global/event", file=sys.stderr)
+
+            sock.settimeout(2)
+            decoder = codecs.getincrementaldecoder("utf-8")("replace")
+            buf, header_ok = "", False
+            while True:
+                r, _, _ = select.select([sock], [], [], 1)
+                if not r:
+                    continue
+                chunk = sock.recv(16384)
+                if not chunk:
+                    break
+                buf += decoder.decode(chunk)
+                if not header_ok:
+                    if "\r\n\r\n" not in buf:
+                        continue
+                    head, buf = buf.split("\r\n\r\n", 1)
+                    if not re.match(r"HTTP/1\.\d\s+2\d\d", head.split("\r\n", 1)[0]):
+                        break
+                    header_ok = True
+                lines = buf.split("\n")
+                buf = lines.pop()
+                for line in lines:
+                    line = line.rstrip("\r")
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if not data:
+                        continue
+                    try:
+                        event = json.loads(data)
+                    except Exception:
+                        continue
+                    try:
+                        _conf_guard_handle(event)
+                    except Exception as e:
+                        print(f"[CONF-GUARD] 处理异常: {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"[CONF-GUARD] 连接异常: {e}", file=sys.stderr)
+        finally:
+            try:
+                if sock:
+                    sock.close()
+            except Exception:
+                pass
+        time.sleep(5)
+
+
+def _conf_guard_handle(event):
+    payload = event.get("payload") or {}
+    etype = payload.get("type")
+    if etype not in ("permission.asked", "question.asked"):
+        return
+    props = payload.get("properties") or {}
+    cid = (props.get("id") or props.get("permissionID") or props.get("permissionId")
+           or props.get("questionID") or props.get("questionId") or "")
+    if not cid:
+        return
+    with _class_conf_guard["lock"]:
+        if cid in _class_conf_guard["seen"]:
+            return
+        _class_conf_guard["seen"].add(cid)
+        # 防止集合无限增长
+        if len(_class_conf_guard["seen"]) > 2000:
+            _class_conf_guard["seen"] = set(list(_class_conf_guard["seen"])[-1000:])
+    kind = "permission" if etype == "permission.asked" else "question"
+    if not _config.get("auto_approve"):
+        print(f"[CONF-GUARD] auto_approve 关闭，{kind} {cid} 待人工处理", file=sys.stderr)
+        return
+    reply_confirmation(cid, kind, props=props)
+
+
+def start_confirmation_guard():
+    with _class_conf_guard["lock"]:
+        if _class_conf_guard["thread"] is not None:
+            return
+        t = threading.Thread(target=_conf_guard_loop, daemon=True, name="conf-guard")
+        _class_conf_guard["thread"] = t
+        t.start()
 
 
 # ============================================================
@@ -770,8 +934,8 @@ class SSEListener:
             if not cid:
                 return
             kind = "permission" if etype == "permission.asked" else "question"
-            if _config.get("auto_approve"):
-                reply_confirmation(cid, kind)
+            # 答复统一交给常驻守护线程（_conf_guard_handle），此处只做转发通知。
+            # 若这里也答一次，会同一条确认被答复两次（上游报错/重复推进）。
             if self.on_confirmation:
                 self._fire(self.on_confirmation, cid, kind, props)
 
@@ -1254,9 +1418,12 @@ class Handler(BaseHTTPRequestHandler):
             listener.stop()
             return _finalize("error", f"failed to send prompt: {str(resp)[:120]}")
 
-        # 等到终态；客户端一旦断开立即收兵，不再空等满 UPSTREAM_TIMEOUT
+        # 等终态。注意：客户端断开时**不能**立刻停监听——
+        # 上游是非幂等 agent，断开后它仍会继续执行并可能弹确认；
+        # 我们把监听掐了，确认就永远无人应答（会话会挂到 App 重启为止）。
+        # 所以断开后只停止向客户端写，监听继续跑到终态或超时。
         deadline = time.time() + UPSTREAM_TIMEOUT
-        while th.is_alive() and time.time() < deadline and not self.client_gone:
+        while th.is_alive() and time.time() < deadline:
             th.join(timeout=1)
         listener.stop()
         th.join(timeout=5)
@@ -1430,6 +1597,9 @@ def main():
         return 0 if models else 2
 
     cleanup_vision_images()
+    # 常驻确认守护：客户端断开、甚至没有任何请求在跑时，也要能应答上游的确认，
+    # 否则 agent 会话会永久挂在"运行中"（真机踩过）。
+    start_confirmation_guard()
     print(f"""
 TeleAgent OpenAI Proxy v{VERSION}（极简版）
   监听      : {host}:{port}

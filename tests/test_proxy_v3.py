@@ -285,6 +285,133 @@ class TestListenerTerminal(unittest.TestCase):
         self.assertEqual(reasoning, ["想想"])
 
 
+class TestQuestionAnswers(unittest.TestCase):
+    """question.asked 的答复必须是上游选项原文（自造值会被判无效）。"""
+
+    def test_real_3_1_1_structure_top_level_questions(self):
+        """真机实测结构：questions 在 props 顶层，tool 里没有选项。"""
+        props = {"id": "que_x", "sessionID": "ses_x",
+                 "questions": [
+                     {"question": "介绍什么内容？", "header": "介绍对象",
+                      "options": [{"label": "某家公司/机构", "description": "..."},
+                                  {"label": "某个产品"}]},
+                     {"question": "什么风格？", "header": "用途与风格",
+                      "options": [{"label": "正式书面"}, {"label": "口语化"}]}],
+                 "tool": {"messageID": "msg_x", "callID": "call_x"}}
+        self.assertEqual(P._pick_question_answers(props),
+                         [["某家公司/机构"], ["正式书面"]])
+
+    def test_multiple_questions_each_answered(self):
+        props = {"questions": [{"options": [{"label": "A"}]},
+                               {"options": [{"label": "B"}]},
+                               {"options": [{"label": "C"}]}]}
+        self.assertEqual(P._pick_question_answers(props), [["A"], ["B"], ["C"]])
+
+    def test_legacy_tool_input_location(self):
+        props = {"tool": {"input": {"questions": [
+            {"options": [{"label": "选项A", "value": "a"}, {"label": "选项B"}]}]}}}
+        self.assertEqual(P._pick_question_answers(props), [["选项A"]])
+
+    def test_plain_string_options(self):
+        props = {"questions": [{"options": ["确认创建", "取消"]}]}
+        self.assertEqual(P._pick_question_answers(props), [["确认创建"]])
+
+    def test_question_without_options_returns_none(self):
+        self.assertIsNone(P._pick_question_answers({"questions": [{"question": "?"}]}))
+        self.assertIsNone(P._pick_question_answers({}))
+        self.assertIsNone(P._pick_question_answers({"tool": {}}))
+
+    def test_partial_options_returns_none(self):
+        """有一题选不出就不算成功——半套答案上游会拒。"""
+        props = {"questions": [{"options": [{"label": "A"}]}, {"options": []}]}
+        self.assertIsNone(P._pick_question_answers(props))
+
+
+class TestConfirmationGuard(unittest.TestCase):
+    """守护线程必须能在没有任何 HTTP 请求时独立应答确认。"""
+
+    def setUp(self):
+        P._config["auto_approve"] = True
+        with P._class_conf_guard["lock"]:
+            P._class_conf_guard["seen"] = set()
+
+    def test_handles_permission_event(self):
+        calls = []
+        old = P.reply_confirmation
+        P.reply_confirmation = lambda cid, kind, props=None, decision="once": calls.append(
+            (cid, kind)) or True
+        try:
+            P._conf_guard_handle({"payload": {"type": "permission.asked",
+                                              "properties": {"id": "per_1"}}})
+        finally:
+            P.reply_confirmation = old
+        self.assertEqual(calls, [("per_1", "permission")])
+
+    def test_handles_question_event(self):
+        calls = []
+        old = P.reply_confirmation
+        P.reply_confirmation = lambda cid, kind, props=None, decision="once": calls.append(
+            (cid, kind)) or True
+        try:
+            P._conf_guard_handle({"payload": {
+                "type": "question.asked",
+                "properties": {"id": "que_1",
+                               "tool": {"input": {"questions": [{"options": ["好"]}]}}}}})
+        finally:
+            P.reply_confirmation = old
+        self.assertEqual(calls, [("que_1", "question")])
+
+    def test_deduplicates_same_conf_id(self):
+        calls = []
+        old = P.reply_confirmation
+        P.reply_confirmation = lambda cid, kind, props=None, decision="once": calls.append(cid) or True
+        try:
+            for _ in range(3):
+                P._conf_guard_handle({"payload": {"type": "permission.asked",
+                                                  "properties": {"id": "per_dup"}}})
+        finally:
+            P.reply_confirmation = old
+        self.assertEqual(calls, ["per_dup"])
+
+    def test_respects_auto_approve_off(self):
+        P._config["auto_approve"] = False
+        calls = []
+        old = P.reply_confirmation
+        P.reply_confirmation = lambda *a, **k: calls.append(a) or True
+        try:
+            P._conf_guard_handle({"payload": {"type": "permission.asked",
+                                              "properties": {"id": "per_2"}}})
+        finally:
+            P.reply_confirmation = old
+        self.assertEqual(calls, [])
+
+    def test_ignores_other_events(self):
+        calls = []
+        old = P.reply_confirmation
+        P.reply_confirmation = lambda *a, **k: calls.append(a) or True
+        try:
+            P._conf_guard_handle({"payload": {"type": "message.part.delta",
+                                              "properties": {"sessionID": "s"}}})
+        finally:
+            P.reply_confirmation = old
+        self.assertEqual(calls, [])
+
+    def test_delta_does_not_trigger_inline_reply(self):
+        """请求内监听只转发通知，不自己答复（避免同一条确认被答两次）。"""
+        calls = []
+        old = P.reply_confirmation
+        P.reply_confirmation = lambda *a, **k: calls.append(a) or True
+        seen = []
+        lsn = P.SSEListener("s", on_confirmation=lambda *a: seen.append(a))
+        try:
+            lsn._handle({"payload": {"type": "permission.asked",
+                                     "properties": {"sessionID": "s", "id": "per_x"}}})
+        finally:
+            P.reply_confirmation = old
+        self.assertEqual(calls, [])
+        self.assertEqual(len(seen), 1)
+
+
 class TestHandlerAuth(unittest.TestCase):
     def test_constant_time_compare(self):
         """不同长度也走 compare_digest，不抛异常。"""
