@@ -171,17 +171,33 @@ def dump_core(pid, path):
     return os.access(path, os.R_OK)
 
 
-# ---------------------------------------------------------------- 抓样本
+# 头名大小写：发送端代码用 X-SA-*，而抓到的字节流可能被网络栈规范化成 X-Sa-*。
+# 用 IGNORECASE 兼容两种，避免某版本漂移后静默失效（结果为 exit 6 无从诊断）。
 SAMPLE_RE = re.compile(
     rb"(GET|POST|PUT|DELETE) (\S+?) HTTP/1\.1\r?\n[^\x00]{0,800}?"
-    rb"X-Sa-Nonce: ([A-Za-z0-9]+)\r?\n[^\x00]{0,200}?"
-    rb"X-Sa-Signature: ([A-Za-z0-9_\-]{43})\r?\n[^\x00]{0,150}?"
-    rb"X-Sa-Timestamp: (\d+)"
+    rb"X-SA-Nonce: ([A-Za-z0-9]+)\r?\n[^\x00]{0,200}?"
+    rb"X-SA-Signature: ([A-Za-z0-9_\-]{43})\r?\n[^\x00]{0,150}?"
+    rb"X-SA-Timestamp: (\d+)",
+    re.IGNORECASE,
 )
 
 
+def _secure_tmp(suffix):
+    """预创建 0600 临时文件（mkstemp）而非 mktemp 返回的裸路径。
+
+    mktemp 只返回路径不建文件，本机其它用户可在间隙里用 symlink 抢占，
+    让随后以 root 执行的 tcpdump/lldb 写到任意位置（TOCTOU）。
+    """
+    fd, path = tempfile.mkstemp(prefix="sa_", suffix=suffix, dir=tempfile.gettempdir())
+    try:
+        os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
+    return path
+
+
 def capture_samples(port):
-    pcap = tempfile.mktemp(prefix="sa_cap_", suffix=".pcap", dir=tempfile.gettempdir())
+    pcap = _secure_tmp(".pcap")
     filt = " or ".join(f"tcp dst port {p}" for p in PORTS)
     proc = subprocess.Popen(["sudo", "-n", "tcpdump", "-i", "lo0", filt,
                              "-s", "0", "-w", pcap],
@@ -280,7 +296,7 @@ def extract():
         return 6
     log(f"获得 {len(samples)} 条样本（首条 {samples[0]['method']} {samples[0]['path'][:60]}）")
 
-    core = tempfile.mktemp(prefix="sa_core_", suffix=".core", dir=tempfile.gettempdir())
+    core = _secure_tmp(".core")
     log(f"转储 ais 内存（PID={pid}）…")
     try:
         if not dump_core(pid, core):

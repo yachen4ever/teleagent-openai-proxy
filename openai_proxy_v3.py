@@ -715,9 +715,9 @@ class SSEListener:
             mid = part.get("messageID") or props.get("messageID") or ""
             text = part.get("text") or ""
 
-            if ptype == "text" and text and mid in self._assistant_msg_ids:
+            if ptype == "text" and mid in self._assistant_msg_ids:
                 self._text_part_ids.add(pid)
-                if not self.text_chunks:
+                if text and not self.text_chunks:
                     self.text_chunks.append(text)
                     self._fire(self.on_delta, text)
             elif ptype == "reasoning" and mid in self._assistant_msg_ids:
@@ -740,12 +740,22 @@ class SSEListener:
             delta = props.get("delta") or ""
             if not delta:
                 return
-            if field == "text" and pid in self._text_part_ids:
+            # 注意：上游对 reasoning part 的增量也用 field="text"，
+            # 唯一区分依据是 partID（part.updated 时登记的类型）。
+            # 因此必须按 ID 判定，不能按 field。
+            if pid in self._text_part_ids:
                 self.text_chunks.append(delta)
                 self._fire(self.on_delta, delta)
-            elif field == "reasoning" or pid in self._reasoning_part_ids:
+            elif pid in self._reasoning_part_ids:
                 self.reasoning_chunks.append(delta)
                 self._fire(self.on_reasoning, delta)
+            elif field == "reasoning":
+                self._reasoning_part_ids.add(pid)
+                self.reasoning_chunks.append(delta)
+                self._fire(self.on_reasoning, delta)
+            # 其它情况：part 尚未登记（多为 part.updated 分包延迟）。
+            # 不猜测归属——推理内容混进正文会污染用户可见输出，宁可等
+            # part.updated 补登记后由后续 delta 继续累积。
 
         elif etype == "session.status":
             status = props.get("status") or {}
@@ -846,15 +856,24 @@ def _log_path(date=None):
 
 
 def log_request(entry):
-    """追加一行。凭据字段一律脱敏后才落盘。"""
+    """追加一行。凭据字段一律脱敏后才落盘。
+
+    日志同时开 0600：里面有 prompt/response 预览，世界可读等于把对话内容
+    暴露给同机其它用户（上游默认就是 0644）。
+    """
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
         entry = dict(entry)
         entry.pop("api_key", None)
         entry.pop("authorization", None)
+        os.chmod(LOG_DIR, 0o700)
         with _log_lock:
-            with open(_log_path(), "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            path = _log_path()
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                os.write(fd, (json.dumps(entry, ensure_ascii=False) + "\n").encode())
+            finally:
+                os.close(fd)
     except Exception as e:
         print(f"[LOG] 落盘失败: {e}", file=sys.stderr)
 

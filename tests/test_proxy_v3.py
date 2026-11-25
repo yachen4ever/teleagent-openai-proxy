@@ -250,6 +250,41 @@ class TestListenerTerminal(unittest.TestCase):
         self.assertEqual(reasoning, ["先想"])
 
 
+    def test_reasoning_delta_has_text_field_upstream(self):
+        """上游对 reasoning part 的增量也用 field='text'，只能靠 partID 区分。"""
+        text, reasoning = [], []
+        lsn = P.SSEListener("s", on_delta=text.append, on_reasoning=reasoning.append)
+        lsn._handle({"payload": {"type": "message.updated",
+                                 "properties": {"sessionID": "s",
+                                                "info": {"role": "assistant", "id": "m1"}}}})
+        # reasoning part 先登记，随后 delta 用 field="text" 到达
+        lsn._handle({"payload": {"type": "message.part.updated",
+                                 "properties": {"sessionID": "s",
+                                                "part": {"type": "reasoning", "id": "r1",
+                                                         "messageID": "m1"}}}})
+        lsn._handle({"payload": {"type": "message.part.delta",
+                                 "properties": {"sessionID": "s", "partID": "r1",
+                                                "field": "text", "delta": "思考中"}}})
+        # 正文 part 登记后同样用 field="text"
+        lsn._handle({"payload": {"type": "message.part.updated",
+                                 "properties": {"sessionID": "s",
+                                                "part": {"type": "text", "id": "t1",
+                                                         "messageID": "m1"}}}})
+        lsn._handle({"payload": {"type": "message.part.delta",
+                                 "properties": {"sessionID": "s", "partID": "t1",
+                                                "field": "text", "delta": "正文"}}})
+        self.assertEqual(reasoning, ["思考中"])
+        self.assertEqual(text, ["正文"])
+
+    def test_reasoning_field_delta_fallback(self):
+        reasoning = []
+        lsn = P.SSEListener("s", on_reasoning=reasoning.append)
+        lsn._handle({"payload": {"type": "message.part.delta",
+                                 "properties": {"sessionID": "s", "partID": "r1",
+                                                "field": "reasoning", "delta": "想想"}}})
+        self.assertEqual(reasoning, ["想想"])
+
+
 class TestHandlerAuth(unittest.TestCase):
     def test_constant_time_compare(self):
         """不同长度也走 compare_digest，不抛异常。"""
