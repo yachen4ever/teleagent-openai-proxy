@@ -327,6 +327,57 @@ class TestQuestionAnswers(unittest.TestCase):
         self.assertIsNone(P._pick_question_answers(props))
 
 
+class TestQuestionPolicy(unittest.TestCase):
+    """选项选择策略：优先推荐项，避开取消/拒绝类。"""
+
+    def setUp(self):
+        self._old = P._config.get("question_policy")
+        P._config["question_policy"] = "recommended"
+
+    def tearDown(self):
+        P._config["question_policy"] = self._old or "recommended"
+
+    def test_prefers_recommended_over_first(self):
+        props = {"questions": [{"question": "?", "options": [
+            {"label": "某个人物"},
+            {"label": "某个项目或方案"},
+            {"label": "商务/工作场景（推荐）"}]}]}
+        self.assertEqual(P._pick_question_answers(props), [["商务/工作场景（推荐）"]])
+
+    def test_avoids_cancel_even_if_first(self):
+        props = {"questions": [{"options": [
+            {"label": "取消"}, {"label": "确认创建"}]}]}
+        self.assertEqual(P._pick_question_answers(props), [["确认创建"]])
+
+    def test_avoids_reject(self):
+        props = {"questions": [{"options": [
+            {"label": "拒绝"}, {"label": "同意"}]}]}
+        self.assertEqual(P._pick_question_answers(props), [["同意"]])
+
+    def test_falls_back_to_first_when_all_neutral(self):
+        props = {"questions": [{"options": [
+            {"label": "红色"}, {"label": "蓝色"}]}]}
+        self.assertEqual(P._pick_question_answers(props), [["红色"]])
+
+    def test_first_policy_ignores_recommended(self):
+        P._config["question_policy"] = "first"
+        props = {"questions": [{"options": [
+            {"label": "取消"}, {"label": "确认（推荐）"}]}]}
+        self.assertEqual(P._pick_question_answers(props), [["取消"]])
+
+    def test_multi_question_each_scored_independently(self):
+        props = {"questions": [
+            {"options": [{"label": "取消"}, {"label": "开始（推荐）"}]},
+            {"options": [{"label": "正式书面"}, {"label": "口语化"}]}]}
+        self.assertEqual(P._pick_question_answers(props),
+                         [["开始（推荐）"], ["正式书面"]])
+
+    def test_score_ordering(self):
+        self.assertGreater(P._score_option("选项A（推荐）"), P._score_option("确认"))
+        self.assertGreater(P._score_option("确认"), P._score_option("随便"))
+        self.assertLess(P._score_option("取消"), P._score_option("随便"))
+
+
 class TestConfirmationGuard(unittest.TestCase):
     """守护线程必须能在没有任何 HTTP 请求时独立应答确认。"""
 

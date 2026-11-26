@@ -97,6 +97,7 @@ _config = {
     "api_key": "",
     "default_model": f"{DEFAULT_PROVIDER}/{DEFAULT_MODEL}",
     "auto_approve": True,
+    "question_policy": "recommended",   # recommended=优先"（推荐）"；first=永远第一个
     "max_inflight": 2,
     "listen_host": "127.0.0.1",
     "listen_port": 8088,
@@ -598,8 +599,49 @@ def extract_assistant_text(messages, min_time=None):
 #   因此确认必须由代理在**后台**独立应答，不能依赖某个 HTTP 请求还活着。
 
 
+# 选项优先级：带"推荐"标记的最高（上游常用"（推荐）"后缀），
+# 其次是肯定/继续类选项，最后才是第一个。避免默认选中"取消/关闭"这类破坏性选项。
+_RECOMMEND_RE = re.compile(r"推荐|建议|默认|recommended", re.IGNORECASE)
+_NEGATIVE_RE = re.compile(r"取消|放弃|不了|关闭|停止|拒绝|不要|否|cancel|reject|abort",
+                          re.IGNORECASE)
+_AFFIRMATIVE_RE = re.compile(r"确认|继续|同意|开始|创建|执行|好的?|是|ok|yes|confirm|continue",
+                             re.IGNORECASE)
+
+
+def _score_option(label):
+    """给选项打分：推荐 > 肯定 > 中性，否定类的降权。"""
+    if _RECOMMEND_RE.search(label):
+        return 30
+    if _NEGATIVE_RE.search(label):
+        return -20
+    if _AFFIRMATIVE_RE.search(label):
+        return 10
+    return 0
+
+
+def _pick_one_option(options):
+    """从一道题的选项里选一个 label：按分数择优，同分取最靠前的。"""
+    candidates = []
+    for idx, o in enumerate(options or []):
+        label = None
+        if isinstance(o, str) and o.strip():
+            label = o.strip()
+        elif isinstance(o, dict):
+            for k in ("label", "value", "text", "name"):
+                v = o.get(k)
+                if isinstance(v, str) and v.strip():
+                    label = v.strip()
+                    break
+        if label:
+            candidates.append((_score_option(label), -idx, label))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)      # 分数高优先；同分时 -idx 大者（即更靠前）优先
+    return candidates[0][2]
+
+
 def _pick_question_answers(props):
-    """从 question.asked 事件给每道题选第一个选项，返回 [[...], [...]]。
+    """从 question.asked 事件给每道题选一个选项，返回 [[label], ...]。
 
     真机实测 3.1.1 结构（2026-11-26）：
       props["questions"] = [{"question": "...", "header": "...",
@@ -610,7 +652,10 @@ def _pick_question_answers(props):
     答复格式（上游 Go 二进制字符串实证）：
       answers 是 **[][]string**（每题一个字符串数组），值必须是选项的 **label**；
       传 []string 会 400：`Mismatch type []string with value string`。
-      单选用单元素数组，多选题可放多个 label。
+
+    选择策略（config.json 的 question_policy 控制）：
+      recommended（默认）—— 优先「（推荐）」，避开「取消/拒绝」，其次选第一个
+      first             —— 永远选第一个（最原始的行为）
     """
     questions = None
     if isinstance(props.get("questions"), list):
@@ -624,23 +669,28 @@ def _pick_question_answers(props):
     if not questions:
         return None
 
+    policy = (_config.get("question_policy") or "recommended").lower()
     answers = []
     for q in questions:
         if not isinstance(q, dict):
             return None
-        chosen = None
-        for o in (q.get("options") or []):
-            if isinstance(o, str) and o.strip():
-                chosen = o.strip()
-                break
-            if isinstance(o, dict):
-                for k in ("label", "value", "text", "name"):
-                    v = o.get(k)
-                    if isinstance(v, str) and v.strip():
-                        chosen = v.strip()
-                        break
-            if chosen:
-                break
+        opts = q.get("options") or []
+        if policy == "first":
+            chosen = None
+            for o in opts:
+                if isinstance(o, str) and o.strip():
+                    chosen = o.strip()
+                    break
+                if isinstance(o, dict):
+                    for k in ("label", "value", "text", "name"):
+                        v = o.get(k)
+                        if isinstance(v, str) and v.strip():
+                            chosen = v.strip()
+                            break
+                if chosen:
+                    break
+        else:
+            chosen = _pick_one_option(opts)
         if chosen is None:
             return None          # 有一题选不出就不答，避免半套答案被上游拒
         answers.append([chosen])  # 每题一个数组（单选取第一个）
